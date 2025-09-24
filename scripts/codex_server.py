@@ -167,5 +167,5 @@ async def post_responses(req: Request):
         return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
 
 
-# Note: This module is meant to be run via uvicorn: `uvicorn scripts.codex-server:app ...`
+# Note: This module is meant to be run via uvicorn: `uvicorn scripts.codex_server:app ...`
 # Intentionally no CLI entrypoints beyond the ASGI `app` object to keep surface minimal.

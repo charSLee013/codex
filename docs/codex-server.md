@@ -11,7 +11,7 @@ Install runtime deps (once): `pip install fastapi uvicorn httpx`
 Start server (ASGI):
 
 ```
-uvicorn scripts.codex-server:app --host 0.0.0.0 --port 8000 --workers 1
+uvicorn scripts.codex_server:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
 Requires `~/.codex/config.toml` and `~/.codex/auth.json` as used by Codex CLI.
