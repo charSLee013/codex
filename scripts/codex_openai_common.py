@@ -43,7 +43,15 @@ def pick_provider(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def endpoints(provider: Dict[str, Any]) -> Dict[str, str]:
-    base = str(provider.get("base_url", "https://api.openai.com/v1")).rstrip("/")
+    # Allow environment override without touching user config
+    # Priority: OPENAI_BASE_URL > CODEX_OPENAI_BASE_URL > CODEX_BASE_URL > provider.base_url > default
+    import os as _os
+    base = (
+        _os.getenv("OPENAI_BASE_URL")
+        or _os.getenv("CODEX_OPENAI_BASE_URL")
+        or _os.getenv("CODEX_BASE_URL")
+        or str(provider.get("base_url", "https://api.openai.com/v1"))
+    ).rstrip("/")
     return {
         "responses": f"{base}/responses",
         "models": f"{base}/models",
