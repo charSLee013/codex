@@ -748,5 +748,15 @@ async def claude_messages(req: Request):
 
 
 
-# Note: This module is meant to be run via uvicorn: `uvicorn scripts.codex_server:app ...`
-# Intentionally no CLI entrypoints beyond the ASGI `app` object to keep surface minimal.
+# You can also run this file directly for local testing. It binds to 127.0.0.1:45443.
+if __name__ == "__main__":
+    try:
+        import uvicorn  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise SystemExit(
+            "uvicorn is required to run codex_server directly.\n"
+            "Install with: pip install uvicorn fastapi \"httpx[http2]\"\n"
+            f"Import error: {e}"
+        )
+
+    uvicorn.run(app, host="127.0.0.1", port=45443, log_level="info")
