@@ -16,6 +16,16 @@ uvicorn scripts.codex_server:app --host 0.0.0.0 --port 8000 --workers 1
 
 Requires `~/.codex/config.toml` and `~/.codex/auth.json` as used by Codex CLI.
 
+Direct run (binds 127.0.0.1:45443):
+
+```
+python scripts/codex_server.py
+```
+
+Notes:
+- The direct-run path uses the same config/auth defaults and starts an ASGI server via `uvicorn.run(app, host="127.0.0.1", port=45443)`.
+- If you see an import error, install deps once: `pip install fastapi uvicorn "httpx[http2]"`.
+
 ## Endpoints
 
 - `GET /v1/models`
