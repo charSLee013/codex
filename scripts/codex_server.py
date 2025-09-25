@@ -790,7 +790,12 @@ async def chat_completions(req: Request):
             return StreamingResponse(event_iter(), media_type="text/event-stream")
 
         # Non-stream: map JSON to Chat Completions response
-        data = await resp.json()
+        # With httpx.stream() we must read the body first before parsing
+        raw = await resp.aread()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return fastapi.Response(content=raw, media_type=resp.headers.get("content-type", "application/json"))
         message = _output_to_chat_message(data.get("output") or [])
         created = int(time.time())
         chat = {
