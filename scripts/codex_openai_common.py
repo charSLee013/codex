@@ -2,11 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 from typing import Any, Dict, List, Optional
 
+# Determine Codex home as read-only config directory.
+# Honor CODEX_HOME environment variable to allow development/testing without
+# touching the user's real ~/.codex directory.
 HOME = pathlib.Path.home()
-CODEX_HOME = HOME / ".codex"
+_ENV_CODEX_HOME = os.getenv("CODEX_HOME")
+CODEX_HOME = pathlib.Path(_ENV_CODEX_HOME).expanduser() if _ENV_CODEX_HOME else (HOME / ".codex")
 CONFIG_PATH = CODEX_HOME / "config.toml"
 AUTH_PATH = CODEX_HOME / "auth.json"
 

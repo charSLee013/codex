@@ -90,6 +90,19 @@ Notes:
 - Server code: `scripts/codex_server.py` (FastAPI + httpx async streaming passthrough, Claude proxy helpers).
 - The server preserves Codex’s instruction/tool assembly so downstream behaviour matches the CLI.
 
+### Config home (read‑only) and isolation
+
+- The server treats your config home as read‑only and never writes credentials.
+- By default it reads from `~/.codex/` (i.e., `~/.codex/config.toml` and `~/.codex/auth.json`).
+- To avoid touching your real `~/.codex` during local testing, set `CODEX_HOME` to an alternate path before starting the server, e.g.:
+
+  ```bash
+  export CODEX_HOME="$PWD/.codex-dev"
+  python scripts/codex_server.py
+  ```
+
+  Then place `config.toml` and `auth.json` under that folder for the test run. This keeps your real `~/.codex` untouched.
+
 ## Concurrency
 
 - FastAPI runs on an event loop; each inbound request is handled asynchronously.
