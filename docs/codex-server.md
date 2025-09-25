@@ -6,7 +6,7 @@ model name (e.g., `gpt-5-high`, `gpt-5-codex-low`).
 
 ## Run
 
-Install runtime deps (once): `pip install fastapi uvicorn httpx`
+Install runtime deps (once): `pip install fastapi uvicorn "httpx[http2]"`
 
 Start server (ASGI):
 
@@ -24,9 +24,18 @@ Requires `~/.codex/config.toml` and `~/.codex/auth.json` as used by Codex CLI.
 
 - `POST /v1/responses`
   - Accepts an OpenAI Responses request body. If the `model` is suffixed with
-    a reasoning effort (e.g., `-minimal|-low|-medium|-high`), the server will
-    set `reasoning.effort` accordingly and forward to the configured provider.
+    a reasoning effort (e.g., `-minimal|-low|-medium|-high`), the server sets
+    `reasoning.effort` accordingly and forwards to the configured provider.
   - Streams events back using `text/event-stream`.
+
+- `POST /claude/v1/messages`
+  - Accepts Anthropic Claude Messages payloads and relays them through the
+    same OpenAI Responses backend.
+  - Converts Claude-style messages, tool calls, and thinking traces into the
+    Responses format on the way in, then maps the streamed/OpenAI JSON reply
+    back into Claude blocks (`text`, `tool_use`, `thinking`).
+  - Mirrors Anthropic’s SSE contract by normalising upstream `data:` events and
+    always emitting a terminal `message_stop` event.
 
 ### Examples
 
@@ -46,6 +55,12 @@ Requires `~/.codex/config.toml` and `~/.codex/auth.json` as used by Codex CLI.
     --data '{"model":"gpt-5-high","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"json please"}]}]}' \\
     http://127.0.0.1:8000/v1/responses | jq .`
 
+- Claude Messages proxy (streamed):
+
+  `curl -N -H 'Content-Type: application/json' \\
+    --data '{"model":"claude-3-5-sonnet","stream":true,"messages":[{"role":"user","content":"ping"}]}' \\
+    http://127.0.0.1:8000/claude/v1/messages`
+
 ## Effort-in-model mapping
 
 - `gpt-5-high` → `{ model: "gpt-5", reasoning: { effort: "high" } }`
@@ -54,7 +69,7 @@ Requires `~/.codex/config.toml` and `~/.codex/auth.json` as used by Codex CLI.
 ## Implementation notes
 
 - Shared logic for auth/config/instructions/tools lives in `scripts/codex_openai_common.py`.
-- Server code: `scripts/codex-server.py` (FastAPI + httpx async streaming passthrough).
+- Server code: `scripts/codex_server.py` (FastAPI + httpx async streaming passthrough, Claude proxy helpers).
 - The server preserves Codex’s instruction/tool assembly so downstream behaviour matches the CLI.
 
 ## Concurrency

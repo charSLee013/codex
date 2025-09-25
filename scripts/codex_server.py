@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import fastapi
 from fastapi import Request
@@ -28,6 +28,297 @@ def parse_effort_from_model(model: str) -> tuple[str, str | None]:
         return parts[0], parts[1].lower()
     return model, None
 
+
+
+
+def _anthropic_content_item_to_text(content_item: Any) -> str:
+    if isinstance(content_item, str):
+        return content_item
+    if isinstance(content_item, dict):
+        text = content_item.get("text")
+        if isinstance(text, str):
+            return text
+    return ""
+
+
+def _text_block_for_role(role: str, text: str) -> Dict[str, Any]:
+    block_type = "input_text" if role in {"user", "system"} else "output_text"
+    return {"type": block_type, "text": text}
+
+
+def _anthropic_tool_use_block(item: Dict[str, Any]) -> Dict[str, Any]:
+    tool_input = item.get("input")
+    if isinstance(tool_input, str):
+        try:
+            tool_input = json.loads(tool_input)
+        except json.JSONDecodeError:
+            tool_input = {"raw": tool_input}
+    if tool_input is None:
+        tool_input = {}
+    return {
+        "type": "tool_use",
+        "id": item.get("id") or str(uuid.uuid4()),
+        "name": item.get("name"),
+        "input": tool_input,
+    }
+
+
+def _anthropic_tool_result_block(item: Dict[str, Any]) -> Dict[str, Any]:
+    tool_use_id = item.get("tool_use_id") or item.get("id") or str(uuid.uuid4())
+    result: Dict[str, Any] = {
+        "type": "tool_result",
+        "tool_use_id": str(tool_use_id),
+    }
+
+    if "is_error" in item:
+        result["is_error"] = bool(item.get("is_error"))
+
+    content_items: List[Dict[str, Any]] = []
+    payload = item.get("content")
+    if isinstance(payload, list):
+        for part in payload:
+            text = _anthropic_content_item_to_text(part)
+            if text:
+                content_items.append({"type": "output_text", "text": text})
+    else:
+        text = _anthropic_content_item_to_text(payload)
+        if text:
+            content_items.append({"type": "output_text", "text": text})
+
+    fallback_text = item.get("text")
+    if not content_items and isinstance(fallback_text, str) and fallback_text:
+        content_items.append({"type": "output_text", "text": fallback_text})
+
+    if content_items:
+        result["content"] = content_items
+
+    return result
+
+
+def _anthropic_messages_to_input(messages: Any, system_prompt: Optional[str]) -> List[dict]:
+    result: List[dict] = []
+
+    if system_prompt:
+        result.append(
+            {
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": str(system_prompt),
+                    }
+                ],
+            }
+        )
+
+    if not isinstance(messages, list):
+        return result
+
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role not in {"user", "assistant", "system"}:
+            continue
+        content = message.get("content")
+        blocks: List[Dict[str, Any]] = []
+        text_parts: List[str] = []
+
+        def flush_text_buffer() -> None:
+            if text_parts:
+                text = "".join(text_parts)
+                if text:
+                    blocks.append(_text_block_for_role(role, text))
+                text_parts.clear()
+
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    item_type = item.get("type")
+                    if item_type in {None, "text"}:
+                        text = _anthropic_content_item_to_text(item)
+                        if text:
+                            text_parts.append(text)
+                        continue
+                    if item_type in {"input_text", "output_text"}:
+                        flush_text_buffer()
+                        text = item.get("text")
+                        if isinstance(text, str) and text:
+                            blocks.append({"type": item_type, "text": text})
+                        continue
+                    if item_type == "tool_use":
+                        flush_text_buffer()
+                        blocks.append(_anthropic_tool_use_block(item))
+                        continue
+                    if item_type == "tool_result":
+                        flush_text_buffer()
+                        blocks.append(_anthropic_tool_result_block(item))
+                        continue
+                    # Unknown item types are skipped.
+                    continue
+                text = _anthropic_content_item_to_text(item)
+                if text:
+                    text_parts.append(text)
+        else:
+            text = _anthropic_content_item_to_text(content)
+            if text:
+                text_parts.append(text)
+
+        flush_text_buffer()
+
+        if not blocks:
+            continue
+
+        result.append({"type": "message", "role": role, "content": blocks})
+
+    return result
+
+
+def _anthropic_output_content(output: List[dict]) -> List[dict]:
+    content: List[dict] = []
+    for block in output or []:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "message":
+            for part in block.get("content", []) or []:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    content.append({"type": "text", "text": text})
+        elif block_type == "tool_call":
+            tool_call = block.get("tool_call") or {}
+            arguments_raw = tool_call.get("arguments")
+            try:
+                arguments = json.loads(arguments_raw) if isinstance(arguments_raw, str) else arguments_raw
+            except json.JSONDecodeError:
+                arguments = {"arguments": arguments_raw}
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": tool_call.get("id") or str(uuid.uuid4()),
+                    "name": tool_call.get("name"),
+                    "input": arguments,
+                }
+            )
+    return content
+
+
+def _anthropic_reasoning_content(reasoning: Any) -> List[dict]:
+    if not isinstance(reasoning, dict):
+        return []
+    encrypted = reasoning.get("encrypted_content")
+    if isinstance(encrypted, str) and encrypted:
+        return [{"type": "thinking", "text": encrypted}]
+    return []
+
+
+def _anthropic_tools_to_responses_tools(tools: Any) -> List[Dict[str, Any]]:
+    if not isinstance(tools, list):
+        return []
+    converted: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        parameters = tool.get("input_schema")
+        if not isinstance(parameters, dict):
+            parameters = {"type": "object", "properties": {}}
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description"),
+                    "parameters": parameters,
+                },
+            }
+        )
+    return converted
+
+
+def _convert_openai_stream_event(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(event, dict):
+        return None
+    event_type = event.get("type")
+    index = event.get("output_index")
+    if not isinstance(index, int):
+        index = 0
+    if event_type == "response.output_text.delta":
+        delta = event.get("delta") or {}
+        text = delta.get("text")
+        if isinstance(text, str) and text:
+            return {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "text_delta",
+                    "text": text,
+                },
+            }
+    elif event_type == "response.output_text.done":
+        # Signal the end of a text content block for this index
+        return {"type": "content_block_stop", "index": index}
+    elif event_type == "response.delta":
+        delta = event.get("delta") or {}
+        thinking = delta.get("thinking")
+        if isinstance(thinking, str) and thinking:
+            return {
+                "type": "thinking_delta",
+                "index": index,
+                "delta": {
+                    "text": thinking,
+                },
+            }
+    elif event_type == "response.tool_call.delta":
+        # Streaming tool call arguments; map to a synthetic event we will expand
+        # into Anthropic content_block_start/input_json_delta in the caller.
+        tool_id = event.get("id") or (event.get("tool_call") or {}).get("id")
+        name = event.get("name") or event.get("tool_name") or (event.get("tool_call") or {}).get("name")
+        delta = event.get("delta") or {}
+        # The chunk may be under 'arguments', or another field; fallback to empty string
+        args_chunk = delta.get("arguments")
+        if args_chunk is None:
+            args_chunk = delta.get("tool_arguments") or delta.get("arguments_delta")
+        if isinstance(args_chunk, (dict, list)):
+            try:
+                import json as _json
+                args_chunk = _json.dumps(args_chunk)
+            except Exception:
+                args_chunk = str(args_chunk)
+        if not isinstance(args_chunk, str):
+            args_chunk = ""
+        return {
+            "type": "tool_call_delta",
+            "index": index,
+            "id": tool_id,
+            "name": name,
+            "arguments": args_chunk,
+        }
+    elif event_type == "response.tool_call.done":
+        # Signal end of current tool_use block on this index
+        return {"type": "tool_call_stop", "index": index}
+    elif event_type in {"response.completed", "response.end"}:
+        return {"type": "message_stop"}
+    return None
+
+
+def _anthropic_response_from_openai(data: Dict[str, Any], fallback_model: str) -> Dict[str, Any]:
+    content = _anthropic_output_content(data.get("output") or [])
+    content.extend(_anthropic_reasoning_content(data.get("reasoning")))
+    return {
+        "id": data.get("id", str(uuid.uuid4())),
+        "type": "message",
+        "role": "assistant",
+        "model": data.get("model", fallback_model),
+        "stop_reason": data.get("stop_reason", "end_turn"),
+        "content": content or [{"type": "text", "text": ""}],
+        "usage": data.get("usage"),
+    }
 
 def make_payload(cfg: Dict[str, Any], model: str, user_body: Dict[str, Any], effort: str | None) -> Dict[str, Any]:
     base_model, _ = parse_effort_from_model(model)
@@ -70,6 +361,25 @@ def make_payload(cfg: Dict[str, Any], model: str, user_body: Dict[str, Any], eff
     # text controls can be passed through from user_body if present
     if user_body.get("text"):
         payload["text"] = user_body["text"]
+
+    # If caller supplied tools, prefer them over defaults and ensure Responses format
+    if isinstance(user_body.get("tools"), list):
+        user_tools = user_body.get("tools")
+        # Detect if already Responses-style: items with {"type": "function", "function": {...}}
+        def _looks_like_responses_tools(tools_list: List[Any]) -> bool:
+            for t in tools_list:
+                if not isinstance(t, dict):
+                    return False
+                if t.get("type") != "function" or not isinstance(t.get("function"), dict):
+                    return False
+            return len(tools_list) > 0
+
+        if _looks_like_responses_tools(user_tools):
+            payload["tools"] = user_tools  # already in correct schema
+        else:
+            converted = _anthropic_tools_to_responses_tools(user_tools)
+            if converted:
+                payload["tools"] = converted
 
     return payload
 
@@ -136,35 +446,306 @@ async def post_responses(req: Request):
     }
     payload["prompt_cache_key"] = conv_id
 
+    stream_ctx = CLIENT.stream("POST", EPS["responses"], headers=headers, json=payload)
+    resp = await stream_ctx.__aenter__()
+    close_resp = True
     try:
-        async with CLIENT.stream("POST", EPS["responses"], headers=headers, json=payload) as resp:
-            if resp.status_code >= 400:
-                # bubble provider error
-                try:
-                    err = await resp.json()
-                except Exception:
-                    err = {"error": {"message": await resp.aread()}}
-                return JSONResponse(err, status_code=resp.status_code)
+        if resp.status_code >= 400:
+            try:
+                err = await resp.json()
+            except Exception:
+                err = {"error": {"message": await resp.aread()}}
+            return JSONResponse(err, status_code=resp.status_code)
 
-            if payload.get("stream", True):
-                async def event_iter():
+        if payload.get("stream", True):
+            close_resp = False
+
+            async def event_iter():
+                try:
+                    async for line in resp.aiter_lines():
+                        if line:
+                            yield (line + "\n").encode("utf-8")
+                        else:
+                            yield b"\n"
+                except httpx.StreamClosed:
+                    pass
+                finally:
+                    await stream_ctx.__aexit__(None, None, None)
+
+            return StreamingResponse(event_iter(), media_type="text/event-stream")
+
+        try:
+            data = await resp.json()
+            return JSONResponse(data)
+        except Exception:
+            raw = await resp.aread()
+            return fastapi.Response(content=raw, media_type=resp.headers.get("content-type", "application/json"))
+    except httpx.RequestError as e:
+        return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
+    finally:
+        if close_resp:
+            await stream_ctx.__aexit__(None, None, None)
+
+
+@app.post("/claude/v1/messages")
+async def claude_messages(req: Request):
+    assert CLIENT is not None
+    body = await req.json()
+    model = body.get("model") or CFG.get("model", "gpt-5-codex")
+    base_model, effort = parse_effort_from_model(model)
+    stream_requested = bool(body.get("stream", False))
+
+    user_body: Dict[str, Any] = {
+        "input": _anthropic_messages_to_input(body.get("messages"), body.get("system")),
+        "stream": stream_requested,
+        "tool_choice": body.get("tool_choice"),
+        "parallel_tool_calls": bool(
+            body.get("parallel_tool_calls") or body.get("allow_parallel_tool_use", False)
+        ),
+        "store": bool(body.get("store", False)),
+    }
+
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        user_body["reasoning"] = reasoning
+
+    payload = make_payload(CFG, base_model, user_body, effort)
+    tools = _anthropic_tools_to_responses_tools(body.get("tools"))
+    if tools:
+        payload["tools"] = tools
+    payload["stream"] = stream_requested
+
+    conv_id = str(uuid.uuid4())
+    headers = {
+        **BASE_HEADERS,
+        "OpenAI-Beta": "responses=experimental",
+        "conversation_id": conv_id,
+        "session_id": conv_id,
+        "Content-Type": "application/json",
+    }
+    headers["Accept"] = "text/event-stream" if stream_requested else "application/json"
+    payload["prompt_cache_key"] = conv_id
+
+    stream_ctx = CLIENT.stream("POST", EPS["responses"], headers=headers, json=payload)
+    resp = await stream_ctx.__aenter__()
+    close_resp = True
+    try:
+        if resp.status_code >= 400:
+            try:
+                err = await resp.json()
+            except Exception:
+                err = {"error": {"message": await resp.aread()}}
+            return JSONResponse(err, status_code=resp.status_code)
+
+        if stream_requested:
+            close_resp = False
+
+            async def event_iter():
+                terminated = False
+                message_started = False
+                # Track currently open content block type per index: 'text' or 'tool_use'
+                open_block: Dict[int, str] = {}
+                tool_meta: Dict[int, Dict[str, Any]] = {}
+
+                def emit(obj: Dict[str, Any]):
+                    return ("data: " + json.dumps(obj) + "\n\n").encode("utf-8")
+
+                def maybe_message_start() -> Optional[bytes]:
+                    nonlocal message_started
+                    if message_started:
+                        return None
+                    message_started = True
+                    # Minimal message object to satisfy Anthropic SSE contract
+                    msg = {
+                        "type": "message_start",
+                        "message": {
+                            "id": str(uuid.uuid4()),
+                            "type": "message",
+                            "role": "assistant",
+                            "model": base_model,
+                            "content": [],
+                        },
+                    }
+                    return emit(msg)
+
+                def open_text(index: int) -> Optional[bytes]:
+                    # If a different block is open, close it first
+                    if open_block.get(index) and open_block[index] != "text":
+                        stop = {"type": "content_block_stop", "index": index}
+                        open_block.pop(index, None)
+                        # yield stop then start
+                        return emit(stop) + emit({
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    if open_block.get(index) == "text":
+                        return None
+                    open_block[index] = "text"
+                    return emit({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "text", "text": ""},
+                    })
+
+                def open_tool(index: int, tool_id: Optional[str], name: Optional[str]) -> bytes:
+                    if not tool_id:
+                        tool_id = str(uuid.uuid4())
+                    if not name:
+                        name = "tool"
+                    # Close different block if needed
+                    parts: list[bytes] = []
+                    if open_block.get(index) and open_block[index] != "tool_use":
+                        parts.append(emit({"type": "content_block_stop", "index": index}))
+                    if open_block.get(index) != "tool_use":
+                        open_block[index] = "tool_use"
+                        tool_meta[index] = {"id": tool_id, "name": name}
+                        parts.append(
+                            emit(
+                                {
+                                    "type": "content_block_start",
+                                    "index": index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": tool_id,
+                                        "name": name,
+                                        "input": {},
+                                    },
+                                }
+                            )
+                        )
+                    return b"".join(parts)
+
+                def close_index(index: int) -> Optional[bytes]:
+                    if open_block.get(index):
+                        open_block.pop(index, None)
+                        tool_meta.pop(index, None)
+                        return emit({"type": "content_block_stop", "index": index})
+                    return None
+
+                try:
                     async for line in resp.aiter_lines():
                         if not line:
                             continue
-                        # Upstream already provides proper SSE lines; forward as-is
-                        yield (line + "\n").encode("utf-8")
+                        stripped = line.strip()
+                        if stripped == "data: [DONE]":
+                            if not terminated:
+                                # Close any open blocks then stop
+                                for idx in list(open_block.keys()):
+                                    buf = close_index(idx)
+                                    if buf:
+                                        yield buf
+                                yield emit({"type": "message_stop"})
+                                terminated = True
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        payload_str = line[5:].strip()
+                        if not payload_str:
+                            continue
+                        try:
+                            event_obj = json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            continue
+                        mapped = _convert_openai_stream_event(event_obj)
+                        if mapped is None:
+                            continue
 
-                return StreamingResponse(event_iter(), media_type="text/event-stream")
+                        t = mapped.get("type")
+                        # Ensure message_start precedes any deltas/starts
+                        if t in {"content_block_delta", "thinking_delta", "tool_call_delta"}:
+                            first = maybe_message_start()
+                            if first:
+                                yield first
 
-            # non-stream JSON
-            try:
-                data = await resp.json()
-                return JSONResponse(data)
-            except Exception:
-                raw = await resp.aread()
-                return fastapi.Response(content=raw, media_type=resp.headers.get("content-type", "application/json"))
+                        if t == "content_block_delta":
+                            idx = int(mapped.get("index", 0))
+                            start = open_text(idx)
+                            if start:
+                                yield start
+                            yield emit(mapped)
+                            continue
+
+                        if t == "content_block_stop":
+                            idx = int(mapped.get("index", 0))
+                            buf = close_index(idx)
+                            if buf:
+                                # We already emit our own stop to keep state consistent
+                                yield buf
+                            else:
+                                # If nothing open, still forward the stop event
+                                yield emit(mapped)
+                            continue
+
+                        if t == "tool_call_delta":
+                            idx = int(mapped.get("index", 0))
+                            pre = open_tool(idx, mapped.get("id"), mapped.get("name"))
+                            if pre:
+                                yield pre
+                            # Emit input_json_delta carrying the partial arguments JSON
+                            yield emit(
+                                {
+                                    "type": "content_block_delta",
+                                    "index": idx,
+                                    "delta": {"type": "input_json_delta", "partial_json": mapped.get("arguments", "")},
+                                }
+                            )
+                            continue
+
+                        if t == "tool_call_stop":
+                            idx = int(mapped.get("index", 0))
+                            buf = close_index(idx)
+                            if buf:
+                                yield buf
+                            else:
+                                yield emit({"type": "content_block_stop", "index": idx})
+                            continue
+
+                        if t == "thinking_delta":
+                            yield emit(mapped)
+                            continue
+
+                        if t == "message_stop":
+                            if not terminated:
+                                # Close open blocks first
+                                for idx in list(open_block.keys()):
+                                    buf = close_index(idx)
+                                    if buf:
+                                        yield buf
+                                yield emit(mapped)
+                                terminated = True
+                            continue
+
+                        # Fallback: forward as-is
+                        yield emit(mapped)
+                except httpx.StreamClosed:
+                    pass
+                finally:
+                    await stream_ctx.__aexit__(None, None, None)
+
+                if not terminated:
+                    # Close any open blocks then stop
+                    for idx in list(open_block.keys()):
+                        buf = close_index(idx)
+                        if buf:
+                            yield buf
+                    yield emit({"type": "message_stop"})
+
+            return StreamingResponse(event_iter(), media_type="text/event-stream")
+
+        raw = await resp.aread()
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return fastapi.Response(content=raw, media_type=resp.headers.get("content-type", "application/json"))
+        converted = _anthropic_response_from_openai(data, model)
+        return JSONResponse(converted)
     except httpx.RequestError as e:
         return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
+    finally:
+        if close_resp:
+            await stream_ctx.__aexit__(None, None, None)
+
 
 
 # Note: This module is meant to be run via uvicorn: `uvicorn scripts.codex_server:app ...`

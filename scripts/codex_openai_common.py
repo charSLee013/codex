@@ -63,7 +63,9 @@ DEFAULT_FALLBACK_MODELS = [
 
 def build_auth_headers(provider: Dict[str, Any], auth: Dict[str, Any]) -> Dict[str, str]:
     headers: Dict[str, str] = {}
-    if provider.get("requires_openai_auth"):
+    # Treat OpenAI-style auth as required by default. This avoids surprising
+    # differences when the config omits `requires_openai_auth`.
+    if provider.get("requires_openai_auth", True):
         tokens = auth.get("tokens") or {}
         access = tokens.get("access_token")
         if access:
