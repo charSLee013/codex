@@ -29,14 +29,18 @@ Notes:
 ## Endpoints
 
 - `GET /v1/models`
-  - Returns a list of model ids. Falls back to a conservative list if the
-    upstream `/models` is unavailable.
+  - Returns the set of models the team has verified internally. This endpoint
+    no longer proxies the upstream `/models`; instead it serves a curated list
+    with capability metadata (callable/function_call/reasoning/effort).
 
 - `POST /v1/responses`
   - Accepts an OpenAI Responses request body. If the `model` is suffixed with
     a reasoning effort (e.g., `-minimal|-low|-medium|-high`), the server sets
     `reasoning.effort` accordingly and forwards to the configured provider.
   - Streams events back using `text/event-stream`.
+  - For callers that omit `stream` or set it to `false`, the proxy still
+    streams upstream and aggregates the result into the canonical Responses
+    JSON before returning.
 
 - `POST /claude/v1/messages`
   - Accepts Anthropic Claude Messages payloads and relays them through the
@@ -45,7 +49,9 @@ Notes:
     Responses format on the way in, then maps the streamed/OpenAI JSON reply
     back into Claude blocks (`text`, `tool_use`, `thinking`).
   - Mirrors Anthropic’s SSE contract by normalising upstream `data:` events and
-  always emitting a terminal `message_stop` event.
+    always emitting a terminal `message_stop` event.
+  - Only accepts models from `/v1/models`. Any other slug returns `400` with the
+    supported list so callers can downgrade cleanly.
 
 - `POST /v1/chat/completions`
   - Compatibility shim that accepts OpenAI Chat Completions requests and adapts
@@ -54,6 +60,8 @@ Notes:
   - Response: mirrors Chat Completions JSON on non-stream; emits
     `chat.completion.chunk` events on stream, including `delta.content` and
     `delta.tool_calls[*].function.arguments` for tool-call streaming.
+  - Non-stream requests are handled locally by replaying the upstream stream
+    and aggregating the final Chat Completions payload.
 
 ### Examples
 
@@ -67,17 +75,16 @@ Notes:
     --data '{"model":"gpt-5-codex-low","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}]}' \\
     http://127.0.0.1:8000/v1/responses`
 
-- Non-stream JSON:
-
-  `curl -sS -H 'Content-Type: application/json' \\
-    --data '{"model":"gpt-5-high","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"json please"}]}]}' \\
-    http://127.0.0.1:8000/v1/responses | jq .`
-
 - Claude Messages proxy (streamed):
 
   `curl -N -H 'Content-Type: application/json' \\
-    --data '{"model":"claude-3-5-sonnet","stream":true,"messages":[{"role":"user","content":"ping"}]}' \\
+    --data '{"model":"gpt-5-codex","stream":true,"messages":[{"role":"user","content":"ping"}]}' \\
     http://127.0.0.1:8000/claude/v1/messages`
+- Claude Messages proxy (aggregated JSON):
+
+  `curl -sS -H 'Content-Type: application/json' \\
+    --data '{"model":"gpt-5-codex","stream":false,"messages":[{"role":"user","content":"ping"}]}' \\
+    http://127.0.0.1:8000/claude/v1/messages | jq .`
 
 ## Effort-in-model mapping
 
@@ -90,18 +97,8 @@ Notes:
 - Server code: `scripts/codex_server.py` (FastAPI + httpx async streaming passthrough, Claude proxy helpers).
 - The server preserves Codex’s instruction/tool assembly so downstream behaviour matches the CLI.
 
-### Config home (read‑only) and isolation
-
-- The server treats your config home as read‑only and never writes credentials.
-- By default it reads from `~/.codex/` (i.e., `~/.codex/config.toml` and `~/.codex/auth.json`).
-- To avoid touching your real `~/.codex` during local testing, set `CODEX_HOME` to an alternate path before starting the server, e.g.:
-
-  ```bash
-  export CODEX_HOME="$PWD/.codex-dev"
-  python scripts/codex_server.py
-  ```
-
-  Then place `config.toml` and `auth.json` under that folder for the test run. This keeps your real `~/.codex` untouched.
+- The server reads credentials and configuration from `~/.codex/config.toml` and `~/.codex/auth.json`.
+- Treat that directory as read-only while the server is running; it will not write back to those files.
 
 ## Concurrency
 

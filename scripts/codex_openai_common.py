@@ -2,16 +2,11 @@
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 from typing import Any, Dict, List, Optional
 
-# Determine Codex home as read-only config directory.
-# Honor CODEX_HOME environment variable to allow development/testing without
-# touching the user's real ~/.codex directory.
 HOME = pathlib.Path.home()
-_ENV_CODEX_HOME = os.getenv("CODEX_HOME")
-CODEX_HOME = pathlib.Path(_ENV_CODEX_HOME).expanduser() if _ENV_CODEX_HOME else (HOME / ".codex")
+CODEX_HOME = HOME / ".codex"
 CONFIG_PATH = CODEX_HOME / "config.toml"
 AUTH_PATH = CODEX_HOME / "auth.json"
 
@@ -43,15 +38,7 @@ def pick_provider(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def endpoints(provider: Dict[str, Any]) -> Dict[str, str]:
-    # Allow environment override without touching user config
-    # Priority: OPENAI_BASE_URL > CODEX_OPENAI_BASE_URL > CODEX_BASE_URL > provider.base_url > default
-    import os as _os
-    base = (
-        _os.getenv("OPENAI_BASE_URL")
-        or _os.getenv("CODEX_OPENAI_BASE_URL")
-        or _os.getenv("CODEX_BASE_URL")
-        or str(provider.get("base_url", "https://api.openai.com/v1"))
-    ).rstrip("/")
+    base = str(provider.get("base_url", "https://api.openai.com/v1")).rstrip("/")
     return {
         "responses": f"{base}/responses",
         "models": f"{base}/models",
@@ -76,9 +63,7 @@ DEFAULT_FALLBACK_MODELS = [
 
 def build_auth_headers(provider: Dict[str, Any], auth: Dict[str, Any]) -> Dict[str, str]:
     headers: Dict[str, str] = {}
-    # Treat OpenAI-style auth as required by default. This avoids surprising
-    # differences when the config omits `requires_openai_auth`.
-    if provider.get("requires_openai_auth", True):
+    if provider.get("requires_openai_auth"):
         tokens = auth.get("tokens") or {}
         access = tokens.get("access_token")
         if access:

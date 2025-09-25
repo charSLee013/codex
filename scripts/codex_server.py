@@ -2,6 +2,9 @@
 from __future__ import annotations
 import json
 import uuid
+import logging
+import os
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional
 
 import fastapi
@@ -21,6 +24,78 @@ from codex_openai_common import (
     DEFAULT_FALLBACK_MODELS,
 )
 
+VERIFIED_MODELS = [
+    {
+        "id": "gpt-5-codex",
+        "capabilities": {
+            "callable": True,
+            "function_call": True,
+            "reasoning": True,
+            "effort": {"minimal": False, "low": True, "medium": True, "high": True},
+        },
+    },
+    {
+        "id": "gpt-5",
+        "capabilities": {
+            "callable": True,
+            "function_call": True,
+            "reasoning": False,
+            "effort": {"minimal": False, "low": True, "medium": False, "high": True},
+        },
+    },
+]
+
+SUPPORTED_MODEL_IDS = [entry["id"] for entry in VERIFIED_MODELS]
+
+async def _collect_openai_response_object(resp: httpx.Response, stream_ctx: Any) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Consume an upstream SSE response and return the final response payload."""
+    final: Optional[Dict[str, Any]] = None
+    reasoning_blocks: List[str] = []
+    error_payload: Optional[Dict[str, Any]] = None
+    try:
+        async for line in resp.aiter_lines():
+            if not line:
+                continue
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped == "data: [DONE]":
+                break
+            if not line.startswith("data:"):
+                continue
+            payload_str = line[5:].strip()
+            if not payload_str:
+                continue
+            try:
+                event_obj = json.loads(payload_str)
+            except json.JSONDecodeError:
+                continue
+            event_type = event_obj.get("type")
+            if event_type == "response.error":
+                err = event_obj.get("error")
+                if isinstance(err, dict):
+                    error_payload = err
+                else:
+                    error_payload = {"message": str(err or event_obj)}
+                break
+            if event_type in {"response.completed", "response.end"}:
+                maybe_resp = event_obj.get("response")
+                if isinstance(maybe_resp, dict):
+                    final = maybe_resp
+                    reasoning = maybe_resp.get("reasoning")
+                    if isinstance(reasoning, dict):
+                        encrypted = reasoning.get("encrypted_content")
+                        if isinstance(encrypted, str) and encrypted:
+                            reasoning_blocks.append(encrypted)
+                if event_type == "response.completed":
+                    break
+    except httpx.StreamClosed:
+        pass
+    finally:
+        await stream_ctx.__aexit__(None, None, None)
+    if final is not None and reasoning_blocks:
+        final["__aggregated_reasoning_content"] = reasoning_blocks
+    return final, error_payload
 
 
 def parse_effort_from_model(model: str) -> tuple[str, str | None]:
@@ -250,8 +325,13 @@ def _convert_openai_stream_event(event: Dict[str, Any]) -> Optional[Dict[str, An
     if not isinstance(index, int):
         index = 0
     if event_type == "response.output_text.delta":
-        delta = event.get("delta") or {}
-        text = delta.get("text")
+        delta_raw = event.get("delta")
+        if isinstance(delta_raw, str):
+            text = delta_raw
+        elif isinstance(delta_raw, dict):
+            text = delta_raw.get("text")
+        else:
+            text = None
         if isinstance(text, str) and text:
             return {
                 "type": "content_block_delta",
@@ -265,8 +345,11 @@ def _convert_openai_stream_event(event: Dict[str, Any]) -> Optional[Dict[str, An
         # Signal the end of a text content block for this index
         return {"type": "content_block_stop", "index": index}
     elif event_type == "response.delta":
-        delta = event.get("delta") or {}
-        thinking = delta.get("thinking")
+        delta_raw = event.get("delta")
+        if isinstance(delta_raw, dict):
+            thinking = delta_raw.get("thinking")
+        else:
+            thinking = None
         if isinstance(thinking, str) and thinking:
             return {
                 "type": "thinking_delta",
@@ -280,11 +363,17 @@ def _convert_openai_stream_event(event: Dict[str, Any]) -> Optional[Dict[str, An
         # into Anthropic content_block_start/input_json_delta in the caller.
         tool_id = event.get("id") or (event.get("tool_call") or {}).get("id")
         name = event.get("name") or event.get("tool_name") or (event.get("tool_call") or {}).get("name")
-        delta = event.get("delta") or {}
-        # The chunk may be under 'arguments', or another field; fallback to empty string
-        args_chunk = delta.get("arguments")
-        if args_chunk is None:
-            args_chunk = delta.get("tool_arguments") or delta.get("arguments_delta")
+        delta_raw = event.get("delta")
+        args_chunk: Any
+        if isinstance(delta_raw, str):
+            # Some providers stream arguments as a raw string chunk
+            args_chunk = delta_raw
+        else:
+            delta = delta_raw if isinstance(delta_raw, dict) else {}
+            # The chunk may be under 'arguments', or another field; fallback to empty string
+            args_chunk = delta.get("arguments")
+            if args_chunk is None:
+                args_chunk = delta.get("tool_arguments") or delta.get("arguments_delta")
         if isinstance(args_chunk, (dict, list)):
             try:
                 import json as _json
@@ -454,8 +543,10 @@ def _output_to_chat_message(output: List[dict]) -> Dict[str, Any]:
 
 def make_payload(cfg: Dict[str, Any], model: str, user_body: Dict[str, Any], effort: str | None) -> Dict[str, Any]:
     base_model, _ = parse_effort_from_model(model)
+    use_minimal_instructions = bool(user_body.pop("_use_minimal_instructions", False))
     tools = tools_for_model(cfg, base_model)
-    instructions = compute_instructions(base_model, include_apply_patch_tool=bool(cfg.get("include_apply_patch_tool", False)))
+    if user_body.pop("_claude_strip_tools", False):
+        tools = []
 
     # Build input from incoming body; accept either Responses-shaped items or a raw string prompt
     input_items = user_body.get("input")
@@ -463,10 +554,26 @@ def make_payload(cfg: Dict[str, Any], model: str, user_body: Dict[str, Any], eff
         prompt_text = user_body.get("prompt") or user_body.get("query") or "ping"
         input_items = [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": str(prompt_text)}]}]
 
+    if use_minimal_instructions:
+        default_instructions = cfg.get("default_claude_instructions") or ""
+    else:
+        default_instructions = compute_instructions(
+            base_model, include_apply_patch_tool=bool(cfg.get("include_apply_patch_tool", False))
+        )
+    provided_instructions = user_body.get("instructions") or cfg.get("default_instructions")
+    if provided_instructions and default_instructions:
+        instructions = f"{default_instructions}\n\n{provided_instructions}"
+    elif provided_instructions:
+        instructions = provided_instructions
+    elif default_instructions:
+        instructions = default_instructions
+    else:
+        instructions = "You are a helpful assistant."
+
     payload: Dict[str, Any] = {
         "model": base_model,
-        "instructions": instructions,
         "input": input_items,
+        "instructions": instructions,
         "tools": tools,
         "tool_choice": user_body.get("tool_choice", "auto"),
         "parallel_tool_calls": bool(user_body.get("parallel_tool_calls", False)),
@@ -497,7 +604,7 @@ def make_payload(cfg: Dict[str, Any], model: str, user_body: Dict[str, Any], eff
     # If caller supplied tools, prefer them over defaults and ensure Responses format
     if isinstance(user_body.get("tools"), list):
         user_tools = user_body.get("tools")
-        # Detect if already Responses-style: items with {"type": "function", "function": {...}}
+
         def _looks_like_responses_tools(tools_list: List[Any]) -> bool:
             for t in tools_list:
                 if not isinstance(t, dict):
@@ -512,6 +619,8 @@ def make_payload(cfg: Dict[str, Any], model: str, user_body: Dict[str, Any], eff
             converted = _anthropic_tools_to_responses_tools(user_tools)
             if converted:
                 payload["tools"] = converted
+    elif tools:
+        payload["tools"] = tools
 
     return payload
 
@@ -524,6 +633,57 @@ EPS = endpoints(PROVIDER)
 AUTH = load_auth()
 BASE_HEADERS = build_auth_headers(PROVIDER, AUTH)
 CLIENT: Optional[httpx.AsyncClient] = None
+LOGGER = logging.getLogger("codex_server")
+if not LOGGER.handlers:
+    LOGGER.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
+
+    # Console handler for info-level summaries
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    LOGGER.addHandler(sh)
+
+    # File handlers (default to workdir if not specified)
+    base_dir = os.getenv("CODEX_LOG_DIR") or os.getcwd()
+
+    err_path = os.getenv("CODEX_ERROR_LOG") or os.path.join(base_dir, "codex_error.log")
+    eh = RotatingFileHandler(err_path, maxBytes=5*1024*1024, backupCount=2, encoding="utf-8")
+    eh.setLevel(logging.WARNING)  # only errors/warnings
+    eh.setFormatter(fmt)
+    LOGGER.addHandler(eh)
+
+    DEBUG_CLAUDE = bool(os.getenv("CODEX_DEBUG_CLAUDE"))
+    if DEBUG_CLAUDE:
+        dbg_path = os.getenv("CODEX_DEBUG_LOG") or os.path.join(base_dir, "codex_claude_debug.log")
+        dh = RotatingFileHandler(dbg_path, maxBytes=10*1024*1024, backupCount=2, encoding="utf-8")
+        dh.setLevel(logging.DEBUG)
+        dh.setFormatter(fmt)
+        LOGGER.addHandler(dh)
+else:
+    DEBUG_CLAUDE = bool(os.getenv("CODEX_DEBUG_CLAUDE"))
+
+def _cdbg(msg: str, *args: Any) -> None:
+    if DEBUG_CLAUDE:
+        LOGGER.debug(msg, *args)
+
+def _probe(kind: str, payload: Dict[str, Any]) -> None:
+    # Minimal, always-on probe for Claude endpoint; writes only metadata (no user text)
+    try:
+        path = os.path.join(os.getcwd(), "codex_claude_probe.log")
+        with open(path, "a", encoding="utf-8") as f:
+            safe = {k: payload.get(k) for k in ("model", "stream", "tool_choice")}
+            tools = []
+            for t in (payload.get("tools") or []):
+                n = None
+                if isinstance(t, dict):
+                    n = t.get("name") or (t.get("function") or {}).get("name")
+                if n:
+                    tools.append(str(n))
+            safe["tools"] = tools
+            f.write(json.dumps({"kind": kind, **safe}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 @app.on_event("startup")
@@ -542,21 +702,8 @@ async def _shutdown():
 
 @app.get("/v1/models")
 async def list_models():
-    assert CLIENT is not None
-    url = EPS["models"]
-    try:
-        r = await CLIENT.get(url, headers=BASE_HEADERS)
-        if r.status_code == 200 and r.headers.get("content-type", "").startswith("application/json"):
-            obj = r.json()
-            data = obj.get("data") if isinstance(obj, dict) else None
-            slugs = [m.get("id") for m in (data or []) if isinstance(m, dict) and m.get("id")]
-            slugs = [s for s in slugs if isinstance(s, str)]
-            if slugs:
-                return JSONResponse({"data": [{"id": m} for m in slugs]})
-    except Exception:
-        pass
-    # Fallback list
-    return JSONResponse({"data": [{"id": m} for m in DEFAULT_FALLBACK_MODELS]})
+    # Do not hit upstream /models – return only the models we have verified.
+    return JSONResponse({"data": VERIFIED_MODELS})
 
 
 @app.post("/v1/responses")
@@ -571,12 +718,15 @@ async def post_responses(req: Request):
     headers = {
         **BASE_HEADERS,
         "OpenAI-Beta": "responses=experimental",
-        "Accept": "text/event-stream" if payload.get("stream", True) else "application/json",
         "conversation_id": conv_id,
         "session_id": conv_id,
         "Content-Type": "application/json",
     }
     payload["prompt_cache_key"] = conv_id
+
+    client_stream = bool(payload.get("stream", True))
+    payload["stream"] = True
+    headers["Accept"] = "text/event-stream"
 
     stream_ctx = CLIENT.stream("POST", EPS["responses"], headers=headers, json=payload)
     resp = await stream_ctx.__aenter__()
@@ -586,10 +736,15 @@ async def post_responses(req: Request):
             try:
                 err = await resp.json()
             except Exception:
-                err = {"error": {"message": await resp.aread()}}
+                raw_err = await resp.aread()
+                text_err = raw_err.decode("utf-8", "ignore")
+                try:
+                    err = json.loads(text_err)
+                except Exception:
+                    err = {"error": {"message": text_err}}
             return JSONResponse(err, status_code=resp.status_code)
 
-        if payload.get("stream", True):
+        if client_stream:
             close_resp = False
 
             async def event_iter():
@@ -606,12 +761,15 @@ async def post_responses(req: Request):
 
             return StreamingResponse(event_iter(), media_type="text/event-stream")
 
-        try:
-            data = await resp.json()
-            return JSONResponse(data)
-        except Exception:
-            raw = await resp.aread()
-            return fastapi.Response(content=raw, media_type=resp.headers.get("content-type", "application/json"))
+        response_obj, error_payload = await _collect_openai_response_object(resp, stream_ctx)
+        close_resp = False
+        if response_obj is not None:
+            if "__aggregated_reasoning_content" in response_obj:
+                response_obj.setdefault("reasoning", {})["encrypted_content"] = response_obj.pop("__aggregated_reasoning_content")
+            return JSONResponse(response_obj)
+        if error_payload is not None:
+            return JSONResponse({"error": error_payload}, status_code=502)
+        return JSONResponse({"error": {"message": "Upstream stream ended without completion"}}, status_code=502)
     except httpx.RequestError as e:
         return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
     finally:
@@ -629,12 +787,12 @@ async def chat_completions(req: Request):
     body = await req.json()
     model = body.get("model") or CFG.get("model", "gpt-5-codex")
     base_model, effort = parse_effort_from_model(model)
-    stream_requested = bool(body.get("stream", False))
+    client_stream = bool(body.get("stream", False))
 
     # Convert Chat messages to Responses input
     user_body: Dict[str, Any] = {
         "input": _chat_messages_to_responses_input(body.get("messages")),
-        "stream": stream_requested,
+        "stream": client_stream,
         "tool_choice": body.get("tool_choice"),
         "parallel_tool_calls": bool(body.get("parallel_tool_calls", False)),
         "store": bool(body.get("store", False)),
@@ -652,7 +810,7 @@ async def chat_completions(req: Request):
         user_body["tools"] = tools
 
     payload = make_payload(CFG, base_model, user_body, effort)
-    payload["stream"] = stream_requested
+    payload["stream"] = True
 
     conv_id = str(uuid.uuid4())
     headers = {
@@ -662,7 +820,7 @@ async def chat_completions(req: Request):
         "session_id": conv_id,
         "Content-Type": "application/json",
     }
-    headers["Accept"] = "text/event-stream" if stream_requested else "application/json"
+    headers["Accept"] = "text/event-stream"
     payload["prompt_cache_key"] = conv_id
 
     stream_ctx = CLIENT.stream("POST", EPS["responses"], headers=headers, json=payload)
@@ -673,10 +831,15 @@ async def chat_completions(req: Request):
             try:
                 err = await resp.json()
             except Exception:
-                err = {"error": {"message": await resp.aread()}}
+                raw_err = await resp.aread()
+                text_err = raw_err.decode("utf-8", "ignore")
+                try:
+                    err = json.loads(text_err)
+                except Exception:
+                    err = {"error": {"message": text_err}}
             return JSONResponse(err, status_code=resp.status_code)
 
-        if stream_requested:
+        if client_stream:
             close_resp = False
 
             async def event_iter():
@@ -789,20 +952,23 @@ async def chat_completions(req: Request):
 
             return StreamingResponse(event_iter(), media_type="text/event-stream")
 
-        # Non-stream: map JSON to Chat Completions response
-        # With httpx.stream() we must read the body first before parsing
-        raw = await resp.aread()
-        try:
-            data = json.loads(raw)
-        except Exception:
-            return fastapi.Response(content=raw, media_type=resp.headers.get("content-type", "application/json"))
-        message = _output_to_chat_message(data.get("output") or [])
+        response_obj, error_payload = await _collect_openai_response_object(resp, stream_ctx)
+        close_resp = False
+        if response_obj is None:
+            if error_payload is not None:
+                return JSONResponse({"error": error_payload}, status_code=502)
+            return JSONResponse({"error": {"message": "Upstream stream ended without completion"}}, status_code=502)
+
+        message = _output_to_chat_message(response_obj.get("output") or [])
+        reasoning_blocks = response_obj.pop("__aggregated_reasoning_content", None)
+        if reasoning_blocks:
+            message["reasoning_content"] = reasoning_blocks
         created = int(time.time())
-        chat = {
-            "id": "chatcmpl-" + conv_id,
+        chat: Dict[str, Any] = {
+            "id": response_obj.get("id", "chatcmpl-" + conv_id),
             "object": "chat.completion",
-            "created": created,
-            "model": base_model,
+            "created": response_obj.get("created_at", created),
+            "model": response_obj.get("model", base_model),
             "choices": [
                 {
                     "index": 0,
@@ -811,8 +977,8 @@ async def chat_completions(req: Request):
                 }
             ],
         }
-        if isinstance(data.get("usage"), dict):
-            chat["usage"] = data["usage"]
+        if isinstance(response_obj.get("usage"), dict):
+            chat["usage"] = response_obj["usage"]
         return JSONResponse(chat)
     except httpx.RequestError as e:
         return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
@@ -824,14 +990,111 @@ async def chat_completions(req: Request):
 async def claude_messages(req: Request):
     assert CLIENT is not None
     body = await req.json()
-    model = body.get("model") or CFG.get("model", "gpt-5-codex")
+    requested_model = body.get("model")
+    if requested_model:
+        base_for_check, _ = parse_effort_from_model(requested_model)
+        if base_for_check not in SUPPORTED_MODEL_IDS:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "Unsupported model",
+                        "supported_models": SUPPORTED_MODEL_IDS,
+                    }
+                },
+                status_code=400,
+            )
+        model = requested_model
+    else:
+        model = CFG.get("model", SUPPORTED_MODEL_IDS[0])
+
     base_model, effort = parse_effort_from_model(model)
+    if base_model not in SUPPORTED_MODEL_IDS:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Unsupported model",
+                    "supported_models": SUPPORTED_MODEL_IDS,
+                }
+            },
+            status_code=400,
+        )
     stream_requested = bool(body.get("stream", False))
 
+    raw_messages = body.get("messages") or []
+    system_chunks: List[str] = []
+    filtered_messages: List[Any] = []
+
+    for msg in raw_messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    text = _anthropic_content_item_to_text(part)
+                    if text:
+                        system_chunks.append(text)
+            else:
+                text = _anthropic_content_item_to_text(content)
+                if text:
+                    system_chunks.append(text)
+            continue
+        filtered_messages.append(msg)
+
+    system_prompt = body.get("system")
+    if isinstance(system_prompt, str) and system_prompt:
+        system_chunks.insert(0, system_prompt)
+
+    # Move system prompt content into the latest user message's text
+    if system_chunks:
+        sys_text = "\n\n".join(system_chunks).strip()
+        last_user_idx = -1
+        for i in range(len(filtered_messages) - 1, -1, -1):
+            if isinstance(filtered_messages[i], dict) and filtered_messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        original_text = ""
+        if last_user_idx >= 0:
+            c = filtered_messages[last_user_idx].get("content")
+            parts: List[str] = []
+            if isinstance(c, list):
+                for it in c:
+                    t = _anthropic_content_item_to_text(it)
+                    if t:
+                        parts.append(t)
+            else:
+                t = _anthropic_content_item_to_text(c)
+                if t:
+                    parts.append(t)
+            original_text = "\n".join(parts).strip()
+            new_text = (
+                "请你遵循下面的规则以及工具调用\n"
+                f"{sys_text}\n\n---\n\n"
+                "下面是我的原始请求\n"
+                f"{original_text}"
+            )
+            filtered_messages[last_user_idx]["content"] = new_text
+        else:
+            new_text = (
+                "请你遵循下面的规则以及工具调用\n"
+                f"{sys_text}\n\n---\n\n"
+                "下面是我的原始请求\n"
+            )
+            filtered_messages.append({"role": "user", "content": new_text})
+
+    # Map Anthropic tool_choice to Responses format if specified
+    tool_choice_in = body.get("tool_choice")
+    mapped_tool_choice = None
+    if isinstance(tool_choice_in, dict) and tool_choice_in.get("type") == "tool":
+        n = tool_choice_in.get("name")
+        if isinstance(n, str) and n:
+            mapped_tool_choice = {"type": "function", "name": n}
+    elif isinstance(tool_choice_in, str):
+        if tool_choice_in in ("auto", "none"):
+            mapped_tool_choice = tool_choice_in
+
     user_body: Dict[str, Any] = {
-        "input": _anthropic_messages_to_input(body.get("messages"), body.get("system")),
+        "input": _anthropic_messages_to_input(filtered_messages, None),
         "stream": stream_requested,
-        "tool_choice": body.get("tool_choice"),
+        "tool_choice": mapped_tool_choice if mapped_tool_choice is not None else body.get("tool_choice"),
         "parallel_tool_calls": bool(
             body.get("parallel_tool_calls") or body.get("allow_parallel_tool_use", False)
         ),
@@ -845,8 +1108,28 @@ async def claude_messages(req: Request):
     payload = make_payload(CFG, base_model, user_body, effort)
     tools = _anthropic_tools_to_responses_tools(body.get("tools"))
     if tools:
+        # Add top-level name/parameters for providers that validate tools[0].name
+        for t in tools:
+            fn = t.get("function") or {}
+            name = t.get("name") or fn.get("name")
+            if name:
+                t.setdefault("name", name)
+            params = fn.get("parameters")
+            if params is not None:
+                t.setdefault("parameters", params)
+            desc = fn.get("description")
+            if desc is not None:
+                t.setdefault("description", desc)
         payload["tools"] = tools
-    payload["stream"] = stream_requested
+    # Debug summary (no request body or user content)
+    _tool_names = []
+    for t in (payload.get("tools") or []):
+        n = t.get("name") or (t.get("function") or {}).get("name")
+        if n:
+            _tool_names.append(str(n))
+    _cdbg("Claude payload summary: model=%s stream=%s tools=%s tool_choice=%s", base_model, True, _tool_names, payload.get("tool_choice"))
+    _probe("claude_payload", {"model": base_model, "stream": True, "tool_choice": payload.get("tool_choice"), "tools": payload.get("tools")})
+    payload["stream"] = True
 
     conv_id = str(uuid.uuid4())
     headers = {
@@ -856,7 +1139,7 @@ async def claude_messages(req: Request):
         "session_id": conv_id,
         "Content-Type": "application/json",
     }
-    headers["Accept"] = "text/event-stream" if stream_requested else "application/json"
+    headers["Accept"] = "text/event-stream"
     payload["prompt_cache_key"] = conv_id
 
     stream_ctx = CLIENT.stream("POST", EPS["responses"], headers=headers, json=payload)
@@ -864,10 +1147,22 @@ async def claude_messages(req: Request):
     close_resp = True
     try:
         if resp.status_code >= 400:
+            # Minimal error log for troubleshooting: status, model, tool names present
+            _tool_names = []
+            for t in (payload.get("tools") or []):
+                n = t.get("name") or (t.get("function") or {}).get("name")
+                if n:
+                    _tool_names.append(str(n))
+            LOGGER.warning("Upstream error status=%s model=%s tools=%s", resp.status_code, payload.get("model"), _tool_names)
             try:
                 err = await resp.json()
             except Exception:
-                err = {"error": {"message": await resp.aread()}}
+                raw_err = await resp.aread()
+                text_err = raw_err.decode("utf-8", "ignore")
+                try:
+                    err = json.loads(text_err)
+                except Exception:
+                    err = {"error": {"message": text_err}}
             return JSONResponse(err, status_code=resp.status_code)
 
         if stream_requested:
@@ -879,6 +1174,8 @@ async def claude_messages(req: Request):
                 # Track currently open content block type per index: 'text' or 'tool_use'
                 open_block: Dict[int, str] = {}
                 tool_meta: Dict[int, Dict[str, Any]] = {}
+                ev_counts_up: Dict[str, int] = {}
+                ev_counts_mapped: Dict[str, int] = {}
 
                 def emit(obj: Dict[str, Any]):
                     return ("data: " + json.dumps(obj) + "\n\n").encode("utf-8")
@@ -980,11 +1277,16 @@ async def claude_messages(req: Request):
                             event_obj = json.loads(payload_str)
                         except json.JSONDecodeError:
                             continue
+                        et = event_obj.get("type")
+                        if isinstance(et, str):
+                            ev_counts_up[et] = ev_counts_up.get(et, 0) + 1
                         mapped = _convert_openai_stream_event(event_obj)
                         if mapped is None:
                             continue
 
                         t = mapped.get("type")
+                        if isinstance(t, str):
+                            ev_counts_mapped[t] = ev_counts_mapped.get(t, 0) + 1
                         # Ensure message_start precedes any deltas/starts
                         if t in {"content_block_delta", "thinking_delta", "tool_call_delta"}:
                             first = maybe_message_start()
@@ -1055,6 +1357,8 @@ async def claude_messages(req: Request):
                     pass
                 finally:
                     await stream_ctx.__aexit__(None, None, None)
+                    _cdbg("Claude upstream events: %s; mapped events: %s", ev_counts_up, ev_counts_mapped)
+                    _probe("claude_stream_counts", {"model": base_model, "stream": True, "tool_choice": payload.get("tool_choice"), "tools": payload.get("tools"), "up": ev_counts_up, "mapped": ev_counts_mapped})
 
                 if not terminated:
                     # Close any open blocks then stop
@@ -1066,18 +1370,154 @@ async def claude_messages(req: Request):
 
             return StreamingResponse(event_iter(), media_type="text/event-stream")
 
-        raw = await resp.aread()
-        try:
-            data = json.loads(raw)
-        except Exception:
-            return fastapi.Response(content=raw, media_type=resp.headers.get("content-type", "application/json"))
-        converted = _anthropic_response_from_openai(data, model)
-        return JSONResponse(converted)
+        response_obj, error_payload = await _collect_openai_response_object(resp, stream_ctx)
+        close_resp = False
+        if response_obj is not None:
+            reasoning_blocks = response_obj.pop("__aggregated_reasoning_content", None)
+            converted = _anthropic_response_from_openai(response_obj, model)
+            if reasoning_blocks:
+                converted.setdefault("reasoning", {}).setdefault("encrypted_content", reasoning_blocks)
+            # Debug summary for non-stream
+            out = response_obj.get("output") or []
+            if isinstance(out, list):
+                kinds = {}
+                for it in out:
+                    if isinstance(it, dict):
+                        k = it.get("type")
+                        if isinstance(k, str):
+                            kinds[k] = kinds.get(k, 0) + 1
+                _cdbg("Claude aggregated output kinds: %s", kinds)
+                _probe("claude_nonstream_kinds", {"model": base_model, "stream": False, "tool_choice": payload.get("tool_choice"), "tools": payload.get("tools"), "kinds": kinds})
+            return JSONResponse(converted)
+        if error_payload is not None:
+            return JSONResponse({"error": error_payload}, status_code=502)
+        return JSONResponse({"error": {"message": "Upstream stream ended without completion"}}, status_code=502)
     except httpx.RequestError as e:
         return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
     finally:
         if close_resp:
             await stream_ctx.__aexit__(None, None, None)
+
+
+@app.post("/claude/v1/messages/count_tokens")
+async def claude_count_tokens(req: Request):
+    body = await req.json()
+    requested_model = body.get("model")
+    if requested_model:
+        base_for_check, _ = parse_effort_from_model(requested_model)
+        if base_for_check not in SUPPORTED_MODEL_IDS:
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "Unsupported model",
+                        "supported_models": SUPPORTED_MODEL_IDS,
+                    }
+                },
+                status_code=400,
+            )
+        model = requested_model
+    else:
+        model = CFG.get("model", SUPPORTED_MODEL_IDS[0])
+
+    base_model, effort = parse_effort_from_model(model)
+    if base_model not in SUPPORTED_MODEL_IDS:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": "Unsupported model",
+                    "supported_models": SUPPORTED_MODEL_IDS,
+                }
+            },
+            status_code=400,
+        )
+
+    raw_messages = body.get("messages") or []
+    system_chunks: List[str] = []
+    filtered_messages: List[Any] = []
+    for msg in raw_messages:
+        if isinstance(msg, dict) and msg.get("role") == "system":
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    text = _anthropic_content_item_to_text(part)
+                    if text:
+                        system_chunks.append(text)
+            else:
+                text = _anthropic_content_item_to_text(content)
+                if text:
+                    system_chunks.append(text)
+            continue
+        filtered_messages.append(msg)
+
+    system_prompt = body.get("system")
+    if isinstance(system_prompt, str) and system_prompt:
+        system_chunks.insert(0, system_prompt)
+
+    if system_chunks:
+        sys_text = "\n\n".join(system_chunks).strip()
+        last_user_idx = -1
+        for i in range(len(filtered_messages) - 1, -1, -1):
+            if isinstance(filtered_messages[i], dict) and filtered_messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        original_text = ""
+        if last_user_idx >= 0:
+            c = filtered_messages[last_user_idx].get("content")
+            parts: List[str] = []
+            if isinstance(c, list):
+                for it in c:
+                    t = _anthropic_content_item_to_text(it)
+                    if t:
+                        parts.append(t)
+            else:
+                t = _anthropic_content_item_to_text(c)
+                if t:
+                    parts.append(t)
+            original_text = "\n".join(parts).strip()
+            new_text = (
+                "请你遵循下面的规则以及工具调用\n"
+                f"{sys_text}\n\n---\n\n"
+                "下面是我的原始请求\n"
+                f"{original_text}"
+            )
+            filtered_messages[last_user_idx]["content"] = new_text
+        else:
+            new_text = (
+                "请你遵循下面的规则以及工具调用\n"
+                f"{sys_text}\n\n---\n\n"
+                "下面是我的原始请求\n"
+            )
+            filtered_messages.append({"role": "user", "content": new_text})
+
+    # Map tool_choice for count_tokens path as well
+    tool_choice_in2 = body.get("tool_choice")
+    mapped_tool_choice2 = None
+    if isinstance(tool_choice_in2, dict) and tool_choice_in2.get("type") == "tool":
+        n = tool_choice_in2.get("name")
+        if isinstance(n, str) and n:
+            mapped_tool_choice2 = {"type": "function", "name": n}
+    elif isinstance(tool_choice_in2, str):
+        if tool_choice_in2 in ("auto", "none"):
+            mapped_tool_choice2 = tool_choice_in2
+
+    user_body: Dict[str, Any] = {
+        "input": _anthropic_messages_to_input(filtered_messages, None),
+        "stream": False,
+        "tool_choice": mapped_tool_choice2 if mapped_tool_choice2 is not None else body.get("tool_choice"),
+        "parallel_tool_calls": bool(body.get("parallel_tool_calls") or body.get("allow_parallel_tool_use", False)),
+        "store": bool(body.get("store", False)),
+    }
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        user_body["reasoning"] = reasoning
+
+    payload = make_payload(CFG, base_model, user_body, effort)
+    tools = _anthropic_tools_to_responses_tools(body.get("tools"))
+    if tools:
+        payload["tools"] = tools
+
+    estimate = max(1, len(json.dumps(payload)) // 4)
+    return JSONResponse({"input_tokens": estimate})
 
 
 
