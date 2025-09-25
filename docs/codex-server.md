@@ -45,7 +45,15 @@ Notes:
     Responses format on the way in, then maps the streamed/OpenAI JSON reply
     back into Claude blocks (`text`, `tool_use`, `thinking`).
   - Mirrors Anthropic’s SSE contract by normalising upstream `data:` events and
-    always emitting a terminal `message_stop` event.
+  always emitting a terminal `message_stop` event.
+
+- `POST /v1/chat/completions`
+  - Compatibility shim that accepts OpenAI Chat Completions requests and adapts
+    them to the Responses backend.
+  - Request: `messages`, `tools` (or legacy `functions`), `tool_choice`, `stream`.
+  - Response: mirrors Chat Completions JSON on non-stream; emits
+    `chat.completion.chunk` events on stream, including `delta.content` and
+    `delta.tool_calls[*].function.arguments` for tool-call streaming.
 
 ### Examples
 

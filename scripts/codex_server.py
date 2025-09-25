@@ -8,6 +8,7 @@ import fastapi
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
+import time
 
 from codex_openai_common import (
     load_config,
@@ -320,6 +321,137 @@ def _anthropic_response_from_openai(data: Dict[str, Any], fallback_model: str) -
         "usage": data.get("usage"),
     }
 
+
+def _chat_messages_to_responses_input(messages: Any) -> List[dict]:
+    """Translate OpenAI Chat Completions messages into Responses input blocks.
+    Supports roles: system, user, assistant, tool.
+    - user/system text -> input_text
+    - assistant text -> output_text; assistant tool_calls -> tool_use blocks
+    - tool role -> mapped to a user message containing tool_result blocks
+    """
+    if not isinstance(messages, list):
+        return []
+    result: List[dict] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in {"system", "user", "assistant", "tool"}:
+            continue
+        content = msg.get("content")
+        blocks: List[Dict[str, Any]] = []
+
+        def add_text(text: str, role_: str):
+            if not isinstance(text, str) or not text:
+                return
+            blocks.append({"type": "input_text" if role_ in {"user", "system"} else "output_text", "text": text})
+
+        # Handle assistant tool_calls
+        if role == "assistant":
+            # text content
+            if isinstance(content, str):
+                add_text(content, role)
+            elif isinstance(content, list):
+                for part in content:
+                    t = part.get("text") if isinstance(part, dict) else (str(part) if isinstance(part, (str, int, float)) else None)
+                    if isinstance(t, str):
+                        add_text(t, role)
+            # tool calls
+            tool_calls = msg.get("tool_calls") or []
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    if tc.get("type") != "function":
+                        continue
+                    fn = tc.get("function") or {}
+                    name = fn.get("name")
+                    args_raw = fn.get("arguments")
+                    args: Any = {}
+                    if isinstance(args_raw, str):
+                        try:
+                            args = json.loads(args_raw)
+                        except json.JSONDecodeError:
+                            args = {"raw": args_raw}
+                    elif isinstance(args_raw, dict):
+                        args = args_raw
+                    blocks.append({"type": "tool_use", "id": tc.get("id") or str(uuid.uuid4()), "name": name, "input": args})
+            if blocks:
+                result.append({"type": "message", "role": "assistant", "content": blocks})
+            continue
+
+        # Map tool role to user tool_result
+        if role == "tool":
+            tc_id = msg.get("tool_call_id") or msg.get("id") or str(uuid.uuid4())
+            text_payload = None
+            if isinstance(content, str):
+                text_payload = content
+            elif isinstance(content, list):
+                # concatenate any text items
+                texts: List[str] = []
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        texts.append(part["text"])
+                    elif isinstance(part, str):
+                        texts.append(part)
+                text_payload = "".join(texts) if texts else None
+            tool_result: Dict[str, Any] = {"type": "tool_result", "tool_use_id": str(tc_id)}
+            if isinstance(text_payload, str) and text_payload:
+                tool_result["content"] = [{"type": "output_text", "text": text_payload}]
+            result.append({"type": "message", "role": "user", "content": [tool_result]})
+            continue
+
+        # system/user messages
+        if isinstance(content, str):
+            add_text(content, role)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    add_text(part["text"], role)
+                elif isinstance(part, str):
+                    add_text(part, role)
+        if blocks:
+            result.append({"type": "message", "role": role, "content": blocks})
+    return result
+
+
+def _output_to_chat_message(output: List[dict]) -> Dict[str, Any]:
+    """Collapse Responses output list into a Chat Completions message.
+    Aggregates text and tool_calls into a single assistant message.
+    """
+    text_buf: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+    for item in output or []:
+        if not isinstance(item, dict):
+            continue
+        t = item.get("type")
+        if t == "message":
+            for part in item.get("content", []) or []:
+                if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                    text_buf.append(part["text"])
+        elif t == "tool_call":
+            tc = item.get("tool_call") or {}
+            fid = tc.get("id") or str(uuid.uuid4())
+            name = tc.get("name")
+            args_raw = tc.get("arguments")
+            if isinstance(args_raw, (dict, list)):
+                try:
+                    args_raw = json.dumps(args_raw)
+                except Exception:
+                    args_raw = str(args_raw)
+            if not isinstance(args_raw, str):
+                args_raw = "{}"
+            tool_calls.append({
+                "id": fid,
+                "type": "function",
+                "function": {"name": name, "arguments": args_raw},
+            })
+    return {
+        "role": "assistant",
+        "content": "".join(text_buf),
+        "tool_calls": tool_calls or None,
+    }
+
 def make_payload(cfg: Dict[str, Any], model: str, user_body: Dict[str, Any], effort: str | None) -> Dict[str, Any]:
     base_model, _ = parse_effort_from_model(model)
     tools = tools_for_model(cfg, base_model)
@@ -486,6 +618,202 @@ async def post_responses(req: Request):
         if close_resp:
             await stream_ctx.__aexit__(None, None, None)
 
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: Request):
+    """Compatibility endpoint that adapts Chat Completions requests to Responses.
+    - Translates messages/tools to Responses schema
+    - Streams back OpenAI Chat Completions chunks, or returns a final Chat payload
+    """
+    assert CLIENT is not None
+    body = await req.json()
+    model = body.get("model") or CFG.get("model", "gpt-5-codex")
+    base_model, effort = parse_effort_from_model(model)
+    stream_requested = bool(body.get("stream", False))
+
+    # Convert Chat messages to Responses input
+    user_body: Dict[str, Any] = {
+        "input": _chat_messages_to_responses_input(body.get("messages")),
+        "stream": stream_requested,
+        "tool_choice": body.get("tool_choice"),
+        "parallel_tool_calls": bool(body.get("parallel_tool_calls", False)),
+        "store": bool(body.get("store", False)),
+    }
+
+    # Tools: prefer `tools`; fallback to legacy `functions`
+    tools = body.get("tools")
+    if not tools and isinstance(body.get("functions"), list):
+        tools = []
+        for fn in body.get("functions"):
+            if not isinstance(fn, dict) or not fn.get("name"):
+                continue
+            tools.append({"type": "function", "function": {"name": fn.get("name"), "description": fn.get("description"), "parameters": fn.get("parameters") or {"type": "object", "properties": {}}}})
+    if tools:
+        user_body["tools"] = tools
+
+    payload = make_payload(CFG, base_model, user_body, effort)
+    payload["stream"] = stream_requested
+
+    conv_id = str(uuid.uuid4())
+    headers = {
+        **BASE_HEADERS,
+        "OpenAI-Beta": "responses=experimental",
+        "conversation_id": conv_id,
+        "session_id": conv_id,
+        "Content-Type": "application/json",
+    }
+    headers["Accept"] = "text/event-stream" if stream_requested else "application/json"
+    payload["prompt_cache_key"] = conv_id
+
+    stream_ctx = CLIENT.stream("POST", EPS["responses"], headers=headers, json=payload)
+    resp = await stream_ctx.__aenter__()
+    close_resp = True
+    try:
+        if resp.status_code >= 400:
+            try:
+                err = await resp.json()
+            except Exception:
+                err = {"error": {"message": await resp.aread()}}
+            return JSONResponse(err, status_code=resp.status_code)
+
+        if stream_requested:
+            close_resp = False
+
+            async def event_iter():
+                created = int(time.time())
+                sent_role = False
+                tool_id_to_idx: Dict[str, int] = {}
+                next_tool_idx = 0
+                try:
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        stripped = line.strip()
+                        if stripped == "data: [DONE]":
+                            # Final stop chunk
+                            chunk = {
+                                "id": conv_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": base_model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            }
+                            yield ("data: " + json.dumps(chunk) + "\n\n").encode("utf-8")
+                            yield b"data: [DONE]\n\n"
+                            return
+                        if not line.startswith("data:"):
+                            continue
+                        payload_str = line[5:].strip()
+                        if not payload_str:
+                            continue
+                        try:
+                            event_obj = json.loads(payload_str)
+                        except json.JSONDecodeError:
+                            continue
+                        mapped = _convert_openai_stream_event(event_obj)
+                        if mapped is None:
+                            continue
+                        t = mapped.get("type")
+
+                        # Emit initial role chunk once
+                        if not sent_role and t in {"content_block_delta", "tool_call_delta"}:
+                            role_chunk = {
+                                "id": conv_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": base_model,
+                                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                            }
+                            yield ("data: " + json.dumps(role_chunk) + "\n\n").encode("utf-8")
+                            sent_role = True
+
+                        if t == "content_block_delta":
+                            delta = mapped.get("delta") or {}
+                            text = delta.get("text") if delta.get("type") == "text_delta" else None
+                            if isinstance(text, str) and text:
+                                chunk = {
+                                    "id": conv_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": base_model,
+                                    "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                                }
+                                yield ("data: " + json.dumps(chunk) + "\n\n").encode("utf-8")
+                            continue
+
+                        if t == "tool_call_delta":
+                            tool_id = mapped.get("id") or str(uuid.uuid4())
+                            name = mapped.get("name")
+                            args = mapped.get("arguments", "")
+                            if tool_id not in tool_id_to_idx:
+                                tool_id_to_idx[tool_id] = next_tool_idx
+                                next_tool_idx += 1
+                            idx = tool_id_to_idx[tool_id]
+                            delta_obj: Dict[str, Any] = {
+                                "tool_calls": [
+                                    {
+                                        "index": idx,
+                                        "id": tool_id,
+                                        "type": "function",
+                                        "function": {"arguments": args},
+                                    }
+                                ]
+                            }
+                            if name and idx == tool_id_to_idx[tool_id]:
+                                delta_obj["tool_calls"][0]["function"]["name"] = name
+                            chunk = {
+                                "id": conv_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": base_model,
+                                "choices": [{"index": 0, "delta": delta_obj, "finish_reason": None}],
+                            }
+                            yield ("data: " + json.dumps(chunk) + "\n\n").encode("utf-8")
+                            continue
+
+                        if t == "message_stop":
+                            chunk = {
+                                "id": conv_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": base_model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            }
+                            yield ("data: " + json.dumps(chunk) + "\n\n").encode("utf-8")
+                            yield b"data: [DONE]\n\n"
+                            return
+                except httpx.StreamClosed:
+                    pass
+                finally:
+                    await stream_ctx.__aexit__(None, None, None)
+
+            return StreamingResponse(event_iter(), media_type="text/event-stream")
+
+        # Non-stream: map JSON to Chat Completions response
+        data = await resp.json()
+        message = _output_to_chat_message(data.get("output") or [])
+        created = int(time.time())
+        chat = {
+            "id": "chatcmpl-" + conv_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": base_model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {k: v for k, v in message.items() if v is not None},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        if isinstance(data.get("usage"), dict):
+            chat["usage"] = data["usage"]
+        return JSONResponse(chat)
+    except httpx.RequestError as e:
+        return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
+    finally:
+        if close_resp:
+            await stream_ctx.__aexit__(None, None, None)
 
 @app.post("/claude/v1/messages")
 async def claude_messages(req: Request):
