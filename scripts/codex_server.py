@@ -21,7 +21,6 @@ from codex_openai_common import (
     build_auth_headers,
     compute_instructions,
     tools_for_model,
-    DEFAULT_FALLBACK_MODELS,
 )
 
 VERIFIED_MODELS = [
@@ -279,6 +278,27 @@ def _anthropic_output_content(output: List[dict]) -> List[dict]:
                     "input": arguments,
                 }
             )
+        elif block_type == "function_call":
+            # Some providers emit function_call items instead of tool_call
+            fc = block.get("function_call") if isinstance(block.get("function_call"), dict) else {}
+            # Fallback to top-level fields if nested object not present
+            fid = fc.get("id") if fc else block.get("id")
+            name = fc.get("name") if fc else block.get("name")
+            arguments_raw = fc.get("arguments") if fc else block.get("arguments")
+            try:
+                arguments = json.loads(arguments_raw) if isinstance(arguments_raw, str) else arguments_raw
+            except json.JSONDecodeError:
+                arguments = {"arguments": arguments_raw}
+            if arguments is None:
+                arguments = {}
+            content.append(
+                {
+                    "type": "tool_use",
+                    "id": fid or str(uuid.uuid4()),
+                    "name": name,
+                    "input": arguments,
+                }
+            )
     return content
 
 
@@ -392,6 +412,66 @@ def _convert_openai_stream_event(event: Dict[str, Any]) -> Optional[Dict[str, An
     elif event_type == "response.tool_call.done":
         # Signal end of current tool_use block on this index
         return {"type": "tool_call_stop", "index": index}
+    elif event_type == "response.output_item.added":
+        # Some providers announce function_call items via output_item.added
+        item = event.get("item") or event.get("output_item") or {}
+        if isinstance(item, dict):
+            itype = item.get("type")
+            if itype in {"function_call", "tool_call"}:
+                tool_id = (
+                    item.get("id")
+                    or item.get("call_id")
+                    or (item.get("function_call") or {}).get("id")
+                )
+                name = item.get("name") or (item.get("function_call") or {}).get("name") or item.get("tool_name")
+                return {
+                    "type": "tool_call_delta",
+                    "index": index,
+                    "id": tool_id,
+                    "name": name,
+                    "arguments": "",
+                }
+    elif event_type == "response.function_call_arguments.delta":
+        # Streaming function_call arguments from Responses API
+        delta_raw = event.get("delta")
+        args_chunk: Any
+        if isinstance(delta_raw, str):
+            args_chunk = delta_raw
+        elif isinstance(delta_raw, dict):
+            # Prefer 'arguments' field; otherwise stringify the dict
+            args_chunk = delta_raw.get("arguments")
+            if args_chunk is None:
+                try:
+                    import json as _json
+                    args_chunk = _json.dumps(delta_raw)
+                except Exception:
+                    args_chunk = str(delta_raw)
+        else:
+            args_chunk = ""
+        if isinstance(args_chunk, (dict, list)):
+            try:
+                import json as _json
+                args_chunk = _json.dumps(args_chunk)
+            except Exception:
+                args_chunk = str(args_chunk)
+        if not isinstance(args_chunk, str):
+            args_chunk = ""
+        tool_id = event.get("id") or event.get("call_id") or (event.get("function_call") or {}).get("id")
+        name = event.get("name") or (event.get("function_call") or {}).get("name") or event.get("tool_name")
+        return {
+            "type": "tool_call_delta",
+            "index": index,
+            "id": tool_id,
+            "name": name,
+            "arguments": args_chunk,
+        }
+    elif event_type == "response.function_call_arguments.done":
+        return {"type": "tool_call_stop", "index": index}
+    elif event_type == "response.output_item.done":
+        # When a function_call item is marked done, close the tool block as a safeguard
+        item = event.get("item") or event.get("output_item") or {}
+        if isinstance(item, dict) and item.get("type") in {"function_call", "tool_call"}:
+            return {"type": "tool_call_stop", "index": index}
     elif event_type in {"response.completed", "response.end"}:
         return {"type": "message_stop"}
     return None
@@ -535,6 +615,24 @@ def _output_to_chat_message(output: List[dict]) -> Dict[str, Any]:
                 "type": "function",
                 "function": {"name": name, "arguments": args_raw},
             })
+        elif t == "function_call":
+            # Convert function_call items to Chat tool_calls
+            fc = item.get("function_call") if isinstance(item.get("function_call"), dict) else {}
+            fid = (fc.get("id") if fc else item.get("id")) or str(uuid.uuid4())
+            name = fc.get("name") if fc else item.get("name")
+            args_raw = fc.get("arguments") if fc else item.get("arguments")
+            if isinstance(args_raw, (dict, list)):
+                try:
+                    args_raw = json.dumps(args_raw)
+                except Exception:
+                    args_raw = str(args_raw)
+            if not isinstance(args_raw, str):
+                args_raw = "{}"
+            tool_calls.append({
+                "id": fid,
+                "type": "function",
+                "function": {"name": name, "arguments": args_raw},
+            })
     return {
         "role": "assistant",
         "content": "".join(text_buf),
@@ -633,9 +731,14 @@ EPS = endpoints(PROVIDER)
 AUTH = load_auth()
 BASE_HEADERS = build_auth_headers(PROVIDER, AUTH)
 CLIENT: Optional[httpx.AsyncClient] = None
+
+# Determine debug mode before configuring handlers so the logger level is correct.
+DEBUG_CLAUDE = bool(os.getenv("CODEX_DEBUG_CLAUDE"))
+
 LOGGER = logging.getLogger("codex_server")
 if not LOGGER.handlers:
-    LOGGER.setLevel(logging.INFO)
+    # Logger level gates all handlers; use DEBUG when CODEX_DEBUG_CLAUDE=1
+    LOGGER.setLevel(logging.DEBUG if DEBUG_CLAUDE else logging.INFO)
     fmt = logging.Formatter("%(levelname)s:%(name)s:%(message)s")
 
     # Console handler for info-level summaries
@@ -648,20 +751,25 @@ if not LOGGER.handlers:
     base_dir = os.getenv("CODEX_LOG_DIR") or os.getcwd()
 
     err_path = os.getenv("CODEX_ERROR_LOG") or os.path.join(base_dir, "codex_error.log")
-    eh = RotatingFileHandler(err_path, maxBytes=5*1024*1024, backupCount=2, encoding="utf-8")
+    eh = RotatingFileHandler(err_path, maxBytes=5*1024*1024, backupCount=2, encoding="utf-8", delay=True)
     eh.setLevel(logging.WARNING)  # only errors/warnings
     eh.setFormatter(fmt)
     LOGGER.addHandler(eh)
 
-    DEBUG_CLAUDE = bool(os.getenv("CODEX_DEBUG_CLAUDE"))
     if DEBUG_CLAUDE:
         dbg_path = os.getenv("CODEX_DEBUG_LOG") or os.path.join(base_dir, "codex_claude_debug.log")
-        dh = RotatingFileHandler(dbg_path, maxBytes=10*1024*1024, backupCount=2, encoding="utf-8")
+        dh = RotatingFileHandler(dbg_path, maxBytes=10*1024*1024, backupCount=2, encoding="utf-8", delay=True)
         dh.setLevel(logging.DEBUG)
         dh.setFormatter(fmt)
+        # Filter out WARNING and above to keep debug file strictly for DEBUG/INFO
+        class _MaxLevelFilter(logging.Filter):
+            def __init__(self, max_level: int) -> None:
+                super().__init__(name="")
+                self.max_level = max_level
+            def filter(self, record: logging.LogRecord) -> bool:  # type: ignore[override]
+                return record.levelno <= self.max_level
+        dh.addFilter(_MaxLevelFilter(logging.INFO))
         LOGGER.addHandler(dh)
-else:
-    DEBUG_CLAUDE = bool(os.getenv("CODEX_DEBUG_CLAUDE"))
 
 def _cdbg(msg: str, *args: Any) -> None:
     if DEBUG_CLAUDE:
@@ -683,6 +791,32 @@ def _probe(kind: str, payload: Dict[str, Any]) -> None:
             safe["tools"] = tools
             f.write(json.dumps({"kind": kind, **safe}, ensure_ascii=False) + "\n")
     except Exception:
+        pass
+
+
+def _log_error_minimal(path: str, status: int, model: Optional[str], tools: Any, tool_choice: Any, note: str = "") -> None:
+    """Write a single-line WARNING with only metadata for troubleshooting.
+    - No user text or payload bodies.
+    """
+    try:
+        tool_names: List[str] = []
+        if isinstance(tools, list):
+            for t in tools:
+                if isinstance(t, dict):
+                    n = t.get("name") or (t.get("function") or {}).get("name")
+                    if isinstance(n, str) and n:
+                        tool_names.append(n)
+        meta = {
+            "path": path,
+            "status": status,
+            "model": model,
+            "tool_choice": tool_choice if isinstance(tool_choice, (str, dict)) else None,
+            "tools": tool_names,
+            "note": note or None,
+        }
+        LOGGER.warning("error: %s", json.dumps(meta, ensure_ascii=False))
+    except Exception:
+        # Never raise from logging
         pass
 
 
@@ -742,6 +876,14 @@ async def post_responses(req: Request):
                     err = json.loads(text_err)
                 except Exception:
                     err = {"error": {"message": text_err}}
+            _log_error_minimal(
+                path="/v1/responses",
+                status=resp.status_code,
+                model=base_model,
+                tools=payload.get("tools"),
+                tool_choice=payload.get("tool_choice"),
+                note="upstream_error",
+            )
             return JSONResponse(err, status_code=resp.status_code)
 
         if client_stream:
@@ -771,6 +913,14 @@ async def post_responses(req: Request):
             return JSONResponse({"error": error_payload}, status_code=502)
         return JSONResponse({"error": {"message": "Upstream stream ended without completion"}}, status_code=502)
     except httpx.RequestError as e:
+        _log_error_minimal(
+            path="/v1/responses",
+            status=502,
+            model=base_model,
+            tools=payload.get("tools"),
+            tool_choice=payload.get("tool_choice"),
+            note=f"request_error:{e}",
+        )
         return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
     finally:
         if close_resp:
@@ -790,10 +940,20 @@ async def chat_completions(req: Request):
     client_stream = bool(body.get("stream", False))
 
     # Convert Chat messages to Responses input
+    # Map Chat-style tool_choice to Responses format
+    tool_choice_in = body.get("tool_choice")
+    mapped_tool_choice_c = None
+    if isinstance(tool_choice_in, dict) and tool_choice_in.get("type") == "function":
+        fn = tool_choice_in.get("function")
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str) and fn.get("name"):
+            mapped_tool_choice_c = {"type": "function", "name": fn.get("name")}
+    elif isinstance(tool_choice_in, str) and tool_choice_in in ("auto", "none"):
+        mapped_tool_choice_c = tool_choice_in
+
     user_body: Dict[str, Any] = {
         "input": _chat_messages_to_responses_input(body.get("messages")),
         "stream": client_stream,
-        "tool_choice": body.get("tool_choice"),
+        "tool_choice": mapped_tool_choice_c if mapped_tool_choice_c is not None else body.get("tool_choice"),
         "parallel_tool_calls": bool(body.get("parallel_tool_calls", False)),
         "store": bool(body.get("store", False)),
     }
@@ -807,7 +967,37 @@ async def chat_completions(req: Request):
                 continue
             tools.append({"type": "function", "function": {"name": fn.get("name"), "description": fn.get("description"), "parameters": fn.get("parameters") or {"type": "object", "properties": {}}}})
     if tools:
-        user_body["tools"] = tools
+        # Ensure Responses format and backfill top-level fields for providers that validate tools[0].name
+        normalized: List[Dict[str, Any]] = []
+        for t in tools:
+            if isinstance(t, dict) and t.get("type") == "function" and isinstance(t.get("function"), dict):
+                fn = t["function"]
+                name = t.get("name") or fn.get("name")
+                params = t.get("parameters") or fn.get("parameters")
+                desc = t.get("description") or fn.get("description")
+                if name:
+                    t.setdefault("name", name)
+                if params is not None:
+                    t.setdefault("parameters", params)
+                if desc is not None:
+                    t.setdefault("description", desc)
+                normalized.append(t)
+            else:
+                # Accept Anthropic-style {name,input_schema}
+                name = t.get("name") if isinstance(t, dict) else None
+                schema = t.get("input_schema") if isinstance(t, dict) else None
+                if isinstance(name, str) and name:
+                    normalized.append({
+                        "type": "function",
+                        "name": name,
+                        "parameters": schema if isinstance(schema, dict) else {"type":"object","properties":{}},
+                        "function": {
+                            "name": name,
+                            "parameters": schema if isinstance(schema, dict) else {"type":"object","properties":{}},
+                        },
+                    })
+        if normalized:
+            user_body["tools"] = normalized
 
     payload = make_payload(CFG, base_model, user_body, effort)
     payload["stream"] = True
@@ -956,7 +1146,23 @@ async def chat_completions(req: Request):
         close_resp = False
         if response_obj is None:
             if error_payload is not None:
+                _log_error_minimal(
+                    path="/v1/chat/completions",
+                    status=502,
+                    model=base_model,
+                    tools=user_body.get("tools"),
+                    tool_choice=user_body.get("tool_choice"),
+                    note="stream_error_payload",
+                )
                 return JSONResponse({"error": error_payload}, status_code=502)
+            _log_error_minimal(
+                path="/v1/chat/completions",
+                status=502,
+                model=base_model,
+                tools=user_body.get("tools"),
+                tool_choice=user_body.get("tool_choice"),
+                note="upstream_stream_ended",
+            )
             return JSONResponse({"error": {"message": "Upstream stream ended without completion"}}, status_code=502)
 
         message = _output_to_chat_message(response_obj.get("output") or [])
@@ -981,6 +1187,14 @@ async def chat_completions(req: Request):
             chat["usage"] = response_obj["usage"]
         return JSONResponse(chat)
     except httpx.RequestError as e:
+        _log_error_minimal(
+            path="/v1/chat/completions",
+            status=502,
+            model=base_model,
+            tools=user_body.get("tools"),
+            tool_choice=user_body.get("tool_choice"),
+            note=f"request_error:{e}",
+        )
         return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
     finally:
         if close_resp:
@@ -994,6 +1208,14 @@ async def claude_messages(req: Request):
     if requested_model:
         base_for_check, _ = parse_effort_from_model(requested_model)
         if base_for_check not in SUPPORTED_MODEL_IDS:
+            _log_error_minimal(
+                path="/claude/v1/messages",
+                status=400,
+                model=requested_model,
+                tools=body.get("tools"),
+                tool_choice=body.get("tool_choice"),
+                note="unsupported_model_param",
+            )
             return JSONResponse(
                 {
                     "error": {
@@ -1009,6 +1231,14 @@ async def claude_messages(req: Request):
 
     base_model, effort = parse_effort_from_model(model)
     if base_model not in SUPPORTED_MODEL_IDS:
+        _log_error_minimal(
+            path="/claude/v1/messages",
+            status=400,
+            model=model,
+            tools=body.get("tools"),
+            tool_choice=body.get("tool_choice"),
+            note="unsupported_model_default",
+        )
         return JSONResponse(
             {
                 "error": {
@@ -1147,13 +1377,14 @@ async def claude_messages(req: Request):
     close_resp = True
     try:
         if resp.status_code >= 400:
-            # Minimal error log for troubleshooting: status, model, tool names present
-            _tool_names = []
-            for t in (payload.get("tools") or []):
-                n = t.get("name") or (t.get("function") or {}).get("name")
-                if n:
-                    _tool_names.append(str(n))
-            LOGGER.warning("Upstream error status=%s model=%s tools=%s", resp.status_code, payload.get("model"), _tool_names)
+            _log_error_minimal(
+                path="/claude/v1/messages",
+                status=resp.status_code,
+                model=base_model,
+                tools=payload.get("tools"),
+                tool_choice=payload.get("tool_choice"),
+                note="upstream_error",
+            )
             try:
                 err = await resp.json()
             except Exception:
@@ -1390,9 +1621,33 @@ async def claude_messages(req: Request):
                 _probe("claude_nonstream_kinds", {"model": base_model, "stream": False, "tool_choice": payload.get("tool_choice"), "tools": payload.get("tools"), "kinds": kinds})
             return JSONResponse(converted)
         if error_payload is not None:
+            _log_error_minimal(
+                path="/claude/v1/messages",
+                status=502,
+                model=base_model,
+                tools=payload.get("tools"),
+                tool_choice=payload.get("tool_choice"),
+                note="stream_error_payload",
+            )
             return JSONResponse({"error": error_payload}, status_code=502)
+        _log_error_minimal(
+            path="/claude/v1/messages",
+            status=502,
+            model=base_model,
+            tools=payload.get("tools"),
+            tool_choice=payload.get("tool_choice"),
+            note="upstream_stream_ended",
+        )
         return JSONResponse({"error": {"message": "Upstream stream ended without completion"}}, status_code=502)
     except httpx.RequestError as e:
+        _log_error_minimal(
+            path="/claude/v1/messages",
+            status=502,
+            model=base_model if 'base_model' in locals() else None,
+            tools=body.get("tools"),
+            tool_choice=body.get("tool_choice"),
+            note=f"request_error:{e}",
+        )
         return JSONResponse({"error": {"message": str(e), "type": "request_error"}}, status_code=502)
     finally:
         if close_resp:
@@ -1406,6 +1661,14 @@ async def claude_count_tokens(req: Request):
     if requested_model:
         base_for_check, _ = parse_effort_from_model(requested_model)
         if base_for_check not in SUPPORTED_MODEL_IDS:
+            _log_error_minimal(
+                path="/claude/v1/messages/count_tokens",
+                status=400,
+                model=requested_model,
+                tools=body.get("tools"),
+                tool_choice=body.get("tool_choice"),
+                note="unsupported_model_param",
+            )
             return JSONResponse(
                 {
                     "error": {
@@ -1421,6 +1684,14 @@ async def claude_count_tokens(req: Request):
 
     base_model, effort = parse_effort_from_model(model)
     if base_model not in SUPPORTED_MODEL_IDS:
+        _log_error_minimal(
+            path="/claude/v1/messages/count_tokens",
+            status=400,
+            model=model,
+            tools=body.get("tools"),
+            tool_choice=body.get("tool_choice"),
+            note="unsupported_model_default",
+        )
         return JSONResponse(
             {
                 "error": {
