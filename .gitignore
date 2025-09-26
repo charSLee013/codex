@@ -84,3 +84,9 @@ CHANGELOG.ignore.md
 # nix related
 .direnv
 .envrc
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/

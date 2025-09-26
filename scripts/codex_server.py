@@ -250,6 +250,44 @@ def _anthropic_messages_to_input(messages: Any, system_prompt: Optional[str]) ->
     return result
 
 
+ALLOWED_RESPONSES_INPUT_CONTENT_TYPES = {
+    "input_text",
+    "input_image",
+    "output_text",
+    "refusal",
+    "input_file",
+    "computer_screenshot",
+    "summary_text",
+}
+
+
+def _sanitize_responses_input_for_upstream(items: List[dict]) -> List[dict]:
+    """Claude adapter only: strip content parts that upstream does not accept in input.
+    - Removes Anthropic-only content types such as tool_use/tool_result from input messages.
+    - Drops messages that become empty after filtering.
+    """
+    sanitized: List[dict] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") != "message":
+            continue
+        role = it.get("role")
+        content_in = it.get("content")
+        if not isinstance(content_in, list):
+            continue
+        content_out: List[dict] = []
+        for part in content_in:
+            if not isinstance(part, dict):
+                continue
+            t = part.get("type")
+            if t in ALLOWED_RESPONSES_INPUT_CONTENT_TYPES:
+                content_out.append(part)
+        if content_out:
+            sanitized.append({"type": "message", "role": role, "content": content_out})
+    return sanitized
+
+
 def _anthropic_output_content(output: List[dict]) -> List[dict]:
     content: List[dict] = []
     for block in output or []:
@@ -1307,8 +1345,12 @@ async def claude_messages(req: Request):
         if tool_choice_in in ("auto", "none"):
             mapped_tool_choice = tool_choice_in
 
+    input_items = _anthropic_messages_to_input(filtered_messages, None)
+    # Claude adapter: strip unsupported content types (e.g., tool_use/tool_result) from input
+    input_items = _sanitize_responses_input_for_upstream(input_items)
+
     user_body: Dict[str, Any] = {
-        "input": _anthropic_messages_to_input(filtered_messages, None),
+        "input": input_items,
         "stream": stream_requested,
         "tool_choice": mapped_tool_choice if mapped_tool_choice is not None else body.get("tool_choice"),
         "parallel_tool_calls": bool(
@@ -1732,8 +1774,10 @@ async def claude_count_tokens(req: Request):
         if tool_choice_in2 in ("auto", "none"):
             mapped_tool_choice2 = tool_choice_in2
 
+    input_items2 = _anthropic_messages_to_input(filtered_messages, None)
+    input_items2 = _sanitize_responses_input_for_upstream(input_items2)
     user_body: Dict[str, Any] = {
-        "input": _anthropic_messages_to_input(filtered_messages, None),
+        "input": input_items2,
         "stream": False,
         "tool_choice": mapped_tool_choice2 if mapped_tool_choice2 is not None else body.get("tool_choice"),
         "parallel_tool_calls": bool(body.get("parallel_tool_calls") or body.get("allow_parallel_tool_use", False)),
