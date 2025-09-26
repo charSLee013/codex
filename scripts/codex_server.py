@@ -321,7 +321,8 @@ def _anthropic_tools_to_responses_tools(tools: Any) -> List[Dict[str, Any]]:
         name = tool.get("name")
         if not isinstance(name, str) or not name:
             continue
-        parameters = tool.get("input_schema")
+        # Accept either Anthropic-style input_schema or generic parameters
+        parameters = tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else tool.get("parameters")
         if not isinstance(parameters, dict):
             parameters = {"type": "object", "properties": {}}
         converted.append(
@@ -794,7 +795,7 @@ def _probe(kind: str, payload: Dict[str, Any]) -> None:
         pass
 
 
-def _log_error_minimal(path: str, status: int, model: Optional[str], tools: Any, tool_choice: Any, note: str = "") -> None:
+def _log_error_minimal(path: str, status: int, model: Optional[str], tools: Any, tool_choice: Any, note: str = "", err: Optional[Dict[str, Any]] = None) -> None:
     """Write a single-line WARNING with only metadata for troubleshooting.
     - No user text or payload bodies.
     """
@@ -814,6 +815,17 @@ def _log_error_minimal(path: str, status: int, model: Optional[str], tools: Any,
             "tools": tool_names,
             "note": note or None,
         }
+        # Attach minimal upstream error fields when available
+        if isinstance(err, dict):
+            e = err.get("error") if isinstance(err.get("error"), dict) else err
+            if isinstance(e, dict):
+                for k in ("code", "type", "param"):
+                    if e.get(k) is not None:
+                        meta[f"err_{k}"] = e.get(k)
+                msg = e.get("message")
+                if isinstance(msg, str) and msg:
+                    # Truncate to 200 chars to avoid verbosity
+                    meta["err_message"] = msg[:200]
         LOGGER.warning("error: %s", json.dumps(meta, ensure_ascii=False))
     except Exception:
         # Never raise from logging
@@ -1206,48 +1218,22 @@ async def claude_messages(req: Request):
     body = await req.json()
     requested_model = body.get("model")
     if requested_model:
-        base_for_check, _ = parse_effort_from_model(requested_model)
-        if base_for_check not in SUPPORTED_MODEL_IDS:
-            _log_error_minimal(
-                path="/claude/v1/messages",
-                status=400,
-                model=requested_model,
-                tools=body.get("tools"),
-                tool_choice=body.get("tool_choice"),
-                note="unsupported_model_param",
-            )
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "Unsupported model",
-                        "supported_models": SUPPORTED_MODEL_IDS,
-                    }
-                },
-                status_code=400,
-            )
-        model = requested_model
+        _base, _eff = parse_effort_from_model(requested_model)
+        if _base not in SUPPORTED_MODEL_IDS:
+            # For /claude endpoints, fallback to gpt-5-codex instead of 400
+            _cdbg("Claude model fallback: requested=%s -> using %s", requested_model, SUPPORTED_MODEL_IDS[0])
+            base_model, effort = SUPPORTED_MODEL_IDS[0], None
+        else:
+            base_model, effort = _base, _eff
     else:
-        model = CFG.get("model", SUPPORTED_MODEL_IDS[0])
-
-    base_model, effort = parse_effort_from_model(model)
-    if base_model not in SUPPORTED_MODEL_IDS:
-        _log_error_minimal(
-            path="/claude/v1/messages",
-            status=400,
-            model=model,
-            tools=body.get("tools"),
-            tool_choice=body.get("tool_choice"),
-            note="unsupported_model_default",
-        )
-        return JSONResponse(
-            {
-                "error": {
-                    "message": "Unsupported model",
-                    "supported_models": SUPPORTED_MODEL_IDS,
-                }
-            },
-            status_code=400,
-        )
+        # default model from config, fallback to first supported if needed
+        model_default = CFG.get("model", SUPPORTED_MODEL_IDS[0])
+        _base, _eff = parse_effort_from_model(model_default)
+        if _base not in SUPPORTED_MODEL_IDS:
+            _cdbg("Claude model fallback: cfg_default=%s -> using %s", model_default, SUPPORTED_MODEL_IDS[0])
+            base_model, effort = SUPPORTED_MODEL_IDS[0], None
+        else:
+            base_model, effort = _base, _eff
     stream_requested = bool(body.get("stream", False))
 
     raw_messages = body.get("messages") or []
@@ -1338,18 +1324,19 @@ async def claude_messages(req: Request):
     payload = make_payload(CFG, base_model, user_body, effort)
     tools = _anthropic_tools_to_responses_tools(body.get("tools"))
     if tools:
-        # Add top-level name/parameters for providers that validate tools[0].name
+        # Upstream validation requires tools[i].name present in addition to function.name.
+        # Duplicate minimal top-level fields for compatibility.
         for t in tools:
             fn = t.get("function") or {}
             name = t.get("name") or fn.get("name")
-            if name:
-                t.setdefault("name", name)
-            params = fn.get("parameters")
-            if params is not None:
-                t.setdefault("parameters", params)
-            desc = fn.get("description")
-            if desc is not None:
-                t.setdefault("description", desc)
+            if isinstance(name, str) and name:
+                t["name"] = name
+            params = t.get("parameters") or fn.get("parameters")
+            if isinstance(params, dict):
+                t["parameters"] = params
+            desc = t.get("description") or fn.get("description")
+            if isinstance(desc, str) and desc:
+                t["description"] = desc
         payload["tools"] = tools
     # Debug summary (no request body or user content)
     _tool_names = []
@@ -1377,14 +1364,6 @@ async def claude_messages(req: Request):
     close_resp = True
     try:
         if resp.status_code >= 400:
-            _log_error_minimal(
-                path="/claude/v1/messages",
-                status=resp.status_code,
-                model=base_model,
-                tools=payload.get("tools"),
-                tool_choice=payload.get("tool_choice"),
-                note="upstream_error",
-            )
             try:
                 err = await resp.json()
             except Exception:
@@ -1394,6 +1373,15 @@ async def claude_messages(req: Request):
                     err = json.loads(text_err)
                 except Exception:
                     err = {"error": {"message": text_err}}
+            _log_error_minimal(
+                path="/claude/v1/messages",
+                status=resp.status_code,
+                model=base_model,
+                tools=payload.get("tools"),
+                tool_choice=payload.get("tool_choice"),
+                note="upstream_error",
+                err=err,
+            )
             return JSONResponse(err, status_code=resp.status_code)
 
         if stream_requested:
@@ -1605,7 +1593,7 @@ async def claude_messages(req: Request):
         close_resp = False
         if response_obj is not None:
             reasoning_blocks = response_obj.pop("__aggregated_reasoning_content", None)
-            converted = _anthropic_response_from_openai(response_obj, model)
+            converted = _anthropic_response_from_openai(response_obj, base_model)
             if reasoning_blocks:
                 converted.setdefault("reasoning", {}).setdefault("encrypted_content", reasoning_blocks)
             # Debug summary for non-stream
@@ -1628,6 +1616,7 @@ async def claude_messages(req: Request):
                 tools=payload.get("tools"),
                 tool_choice=payload.get("tool_choice"),
                 note="stream_error_payload",
+                err={"error": error_payload},
             )
             return JSONResponse({"error": error_payload}, status_code=502)
         _log_error_minimal(
@@ -1659,48 +1648,20 @@ async def claude_count_tokens(req: Request):
     body = await req.json()
     requested_model = body.get("model")
     if requested_model:
-        base_for_check, _ = parse_effort_from_model(requested_model)
-        if base_for_check not in SUPPORTED_MODEL_IDS:
-            _log_error_minimal(
-                path="/claude/v1/messages/count_tokens",
-                status=400,
-                model=requested_model,
-                tools=body.get("tools"),
-                tool_choice=body.get("tool_choice"),
-                note="unsupported_model_param",
-            )
-            return JSONResponse(
-                {
-                    "error": {
-                        "message": "Unsupported model",
-                        "supported_models": SUPPORTED_MODEL_IDS,
-                    }
-                },
-                status_code=400,
-            )
-        model = requested_model
+        _base, _eff = parse_effort_from_model(requested_model)
+        if _base not in SUPPORTED_MODEL_IDS:
+            _cdbg("Claude count_tokens model fallback: requested=%s -> using %s", requested_model, SUPPORTED_MODEL_IDS[0])
+            base_model, effort = SUPPORTED_MODEL_IDS[0], None
+        else:
+            base_model, effort = _base, _eff
     else:
-        model = CFG.get("model", SUPPORTED_MODEL_IDS[0])
-
-    base_model, effort = parse_effort_from_model(model)
-    if base_model not in SUPPORTED_MODEL_IDS:
-        _log_error_minimal(
-            path="/claude/v1/messages/count_tokens",
-            status=400,
-            model=model,
-            tools=body.get("tools"),
-            tool_choice=body.get("tool_choice"),
-            note="unsupported_model_default",
-        )
-        return JSONResponse(
-            {
-                "error": {
-                    "message": "Unsupported model",
-                    "supported_models": SUPPORTED_MODEL_IDS,
-                }
-            },
-            status_code=400,
-        )
+        model_default = CFG.get("model", SUPPORTED_MODEL_IDS[0])
+        _base, _eff = parse_effort_from_model(model_default)
+        if _base not in SUPPORTED_MODEL_IDS:
+            _cdbg("Claude count_tokens model fallback: cfg_default=%s -> using %s", model_default, SUPPORTED_MODEL_IDS[0])
+            base_model, effort = SUPPORTED_MODEL_IDS[0], None
+        else:
+            base_model, effort = _base, _eff
 
     raw_messages = body.get("messages") or []
     system_chunks: List[str] = []
